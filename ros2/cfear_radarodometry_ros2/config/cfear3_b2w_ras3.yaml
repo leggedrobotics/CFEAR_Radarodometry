@@ -1,0 +1,83 @@
+# CFEAR-3 parameters for the b2w_rsl deployment: NavTech RAS-3, published by the
+# leggedrobotics navtech_radar_ros driver fork on /radar_data/fft_data and
+# /radar_data/configuration_data (byte-array wire format -> message_format:
+# legacy_bytes, see legacy_radar_codec.h).
+#
+# radar.* geometry values are only the FALLBACK, used until the driver's
+# RadarConfigurationMessage arrives (radar.config_timeout_sec). They come from
+# the RSL RAS-3 setup description (H=400, W=3371, range_resolution=0.0596) and
+# are UNVERIFIED against the real sensor - nobody has run this against
+# hardware yet. In particular:
+#   - encoder_size below is a placeholder equal to azimuth_samples (we were
+#     only given the coarse azimuth_resolution=0.9deg, not the sensor's actual
+#     encoder tick count e.g. 5600 on other Navtech units) - harmless as long
+#     as the live configuration message arrives before config_timeout_sec.
+#   - rotation_rate_hz keeps the Boreas default (4 Hz); not confirmed for RAS-3.
+#   - legacy_bin_size_scale assumes the driver's raw bin_size register is in
+#     units of 1/10000 m (matches range_resolution=0.0596 <-> raw ~596); verify
+#     against the RCLCPP_INFO_ONCE log line the node prints on first config.
+# The CFEAR-3 algorithm parameters (driver/fuser/out) are carried over
+# unchanged from cfear3_boreas.yaml (Boreas-validated); re-tune once real RAS-3
+# trajectories are available.
+cfear_odometry_node:
+  ros__parameters:
+    radar:
+      message_format: legacy_bytes      # navtech_radar_ros driver fork (byte-array messages)
+      fft_topic: /radar_data/fft_data
+      config_topic: /radar_data/configuration_data
+      fft_reliability: reliable         # driver publishes both topics RELIABLE, not best_effort
+      config_durability: volatile       # driver does NOT set transient_local - start this node
+                                        # before/with the driver, or restart the driver after
+      config_timeout_sec: 5.0
+      azimuth_samples: 400
+      encoder_size: 400                 # placeholder fallback only, see header comment
+      range_in_bins: 3371
+      range_res: 0.0596                 # m/bin
+      rotation_rate_hz: 4.0             # unverified for RAS-3, see header comment
+      legacy_bin_size_scale: 1.0e-4     # unverified assumption, see header comment
+      max_missing_fraction: 0.25        # drop scans missing more azimuths than this
+      min_filtered_points: 20
+      stamp_source: first_azimuth       # first_azimuth | last_azimuth | now
+
+    driver:
+      z_min: 60.0
+      k_strongest: 40
+      min_distance: 2.5
+      filter_type: kstrong              # kstrong | CA-CFAR
+      publish_filtered: false           # debug: publish filtered cloud as PointCloud2
+      filtered_topic: radar_filtered
+
+    fuser:
+      cost_type: P2P
+      loss_type: Huber
+      loss_limit: 0.1
+      weight_option: 4
+      weight_intensity: true
+      res: 3.0
+      submap_scan_size: 4
+      registered_min_keyframe_dist: 1.5
+      min_keyframe_rot_deg: 5.0
+      use_keyframe: true
+      use_guess: true
+      compensate: true
+      radar_ccw: true                   # Boreas-validated value; flip if the trajectory
+                                        # comes out mirrored on the real RAS-3
+      covar_scale: 1.0
+      regularization: 0.0
+      soft_constraint: false
+      disable_registration: false
+      downsample_factor: 1.0
+      store_graph: false
+
+    out:
+      odom_topic: /cfear/odometry       # NOT /odometry: fognav_replay also publishes there
+                                        # (from dataset ground truth) - never run both at once
+      odom_keyframe_topic: /cfear/odometry_keyframe
+      registered_cloud_topic: radar_registered
+      registered_keyframe_cloud_topic: radar_registered_keyframe
+      publish_registered_cloud: true
+      publish_tf: true
+
+    frames:
+      odom_frame: odom
+      radar_frame: radar_link

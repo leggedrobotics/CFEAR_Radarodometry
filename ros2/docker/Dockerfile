@@ -38,6 +38,7 @@ ENV CYCLONEDDS_URI=file:///ws/config/cyclonedds.xml
 
 WORKDIR /ws
 COPY ros2/navtech_msgs src/navtech_msgs
+COPY ros2/messages src/messages
 COPY ros2/cfear_radarodometry_ros2 src/cfear_radarodometry_ros2
 
 RUN . /opt/ros/jazzy/setup.sh && \

@@ -1,13 +1,20 @@
 /* Online CFEAR radar odometry node (ROS2 Jazzy).
  *
  * Pipeline:
- *   navtech_msgs/RadarFftDataMsg (one azimuth per message, e.g. /radar_data/fft)
+ *   FFT message (one azimuth per message, e.g. /radar_data/fft)
  *     -> FftRotationAssembler (full polar rotation, mono8 rows=azimuths)
  *     -> radarDriver (k-strongest filtering -> point clouds)
  *     -> OdometryKeyframeFuser (CFEAR registration -> nav_msgs/Odometry on /odometry [+ tf])
  *
+ * Two wire formats are supported, selected by radar.message_format:
+ *   - "navtech_msgs" (default): navtech_msgs/RadarFftDataMsg + RadarConfigurationMsg,
+ *     the official Navtech IA SDK messages (plain-typed fields).
+ *   - "legacy_bytes": messages/RadarFftDataMessage + RadarConfigurationMessage, the
+ *     leggedrobotics navtech_radar_ros driver fork (every scalar field packed as a
+ *     network-order uint8[] byte array). See legacy_radar_codec.h for the decode.
+ *
  * Radar geometry (azimuth samples, encoder size, range bins, bin size) is taken
- * from the driver's RadarConfigurationMsg when available; after
+ * from the driver's radar configuration message when available; after
  * radar.config_timeout_sec it falls back to the radar.* parameters.
  */
 #include <atomic>
@@ -20,10 +27,13 @@
 #include <cv_bridge/cv_bridge.hpp>
 #include <rclcpp/rclcpp.hpp>
 
+#include <messages/msg/radar_configuration_message.hpp>
+#include <messages/msg/radar_fft_data_message.hpp>
 #include <navtech_msgs/msg/radar_configuration_msg.hpp>
 #include <navtech_msgs/msg/radar_fft_data_msg.hpp>
 
 #include "cfear_radarodometry/fft_assembler.h"
+#include "cfear_radarodometry/legacy_radar_codec.h"
 #include "cfear_radarodometry/odometrykeyframefuser.h"
 #include "cfear_radarodometry/radar_driver.h"
 
@@ -40,6 +50,12 @@ public:
 
     const std::string fft_topic = get_parameter("radar.fft_topic").as_string();
     const std::string config_topic = get_parameter("radar.config_topic").as_string();
+    message_format_ = get_parameter("radar.message_format").as_string();
+    if (message_format_ != "navtech_msgs" && message_format_ != "legacy_bytes") {
+      RCLCPP_WARN(get_logger(), "Unknown radar.message_format '%s' - falling back to 'navtech_msgs'",
+                  message_format_.c_str());
+      message_format_ = "navtech_msgs";
+    }
 
     // FFT azimuths arrive at ~azimuth_samples * rotation_rate msg/s (e.g. 1600/s);
     // the depth buffers roughly two rotations of executor jitter.
@@ -54,12 +70,21 @@ public:
     if (get_parameter("radar.config_durability").as_string() == "transient_local")
       config_qos.transient_local();
 
-    fft_sub_ = create_subscription<navtech_msgs::msg::RadarFftDataMsg>(
-        fft_topic, fft_qos,
-        std::bind(&CfearOdometryNode::FftCallback, this, std::placeholders::_1));
-    config_sub_ = create_subscription<navtech_msgs::msg::RadarConfigurationMsg>(
-        config_topic, config_qos,
-        std::bind(&CfearOdometryNode::ConfigCallback, this, std::placeholders::_1));
+    if (message_format_ == "legacy_bytes") {
+      fft_sub_legacy_ = create_subscription<messages::msg::RadarFftDataMessage>(
+          fft_topic, fft_qos,
+          std::bind(&CfearOdometryNode::FftCallbackLegacy, this, std::placeholders::_1));
+      config_sub_legacy_ = create_subscription<messages::msg::RadarConfigurationMessage>(
+          config_topic, config_qos,
+          std::bind(&CfearOdometryNode::ConfigCallbackLegacy, this, std::placeholders::_1));
+    } else {
+      fft_sub_ = create_subscription<navtech_msgs::msg::RadarFftDataMsg>(
+          fft_topic, fft_qos,
+          std::bind(&CfearOdometryNode::FftCallback, this, std::placeholders::_1));
+      config_sub_ = create_subscription<navtech_msgs::msg::RadarConfigurationMsg>(
+          config_topic, config_qos,
+          std::bind(&CfearOdometryNode::ConfigCallback, this, std::placeholders::_1));
+    }
 
     const double timeout = get_parameter("radar.config_timeout_sec").as_double();
     config_timeout_timer_ = create_wall_timer(
@@ -68,9 +93,11 @@ public:
 
     worker_ = std::thread(&CfearOdometryNode::WorkerLoop, this);
 
-    RCLCPP_INFO(get_logger(), "Listening for FFT data on '%s' (%s), radar configuration on '%s'",
+    RCLCPP_INFO(get_logger(),
+                "Listening for FFT data on '%s' (%s, format=%s), radar configuration on '%s'",
                 fft_topic.c_str(),
                 get_parameter("radar.fft_reliability").as_string().c_str(),
+                message_format_.c_str(),
                 config_topic.c_str());
   }
 
@@ -94,6 +121,14 @@ private:
     declare_parameter<std::string>("radar.fft_reliability", "best_effort"); // or "reliable"
     declare_parameter<std::string>("radar.config_durability", "transient_local"); // or "volatile"
     declare_parameter<double>("radar.config_timeout_sec", 5.0);
+    // "navtech_msgs" (official Navtech IA SDK, plain-typed fields) or
+    // "legacy_bytes" (leggedrobotics navtech_radar_ros fork, byte-array fields -
+    // see legacy_radar_codec.h). The two are NOT wire compatible with each other.
+    declare_parameter<std::string>("radar.message_format", "navtech_msgs");
+    // legacy_bytes only: raw-bin_size-register -> metres scale factor, see
+    // legacy_radar_codec.h::DecodeBinSizeRawNativeEndian for why this is needed
+    // and why it is an unconfirmed assumption.
+    declare_parameter<double>("radar.legacy_bin_size_scale", 1e-4);
     declare_parameter<int>("radar.azimuth_samples", 400);
     declare_parameter<int>("radar.encoder_size", 5600);
     declare_parameter<int>("radar.range_in_bins", 3768);
@@ -164,7 +199,38 @@ private:
     cfg.rotation_rate_hz = msg->expected_rotation_rate > 0
         ? static_cast<double>(msg->expected_rotation_rate)
         : get_parameter("radar.rotation_rate_hz").as_double();
+    HandleRadarConfig(cfg);
+  }
 
+  // legacy_bytes format: every scalar field is a network-order (big-endian) byte
+  // array, except bin_size which the driver encodes natively (no swap) - see
+  // legacy_radar_codec.h. bin_size is also the sensor's raw register value, not
+  // metres, hence radar.legacy_bin_size_scale.
+  void ConfigCallbackLegacy(const messages::msg::RadarConfigurationMessage::SharedPtr msg) {
+    RadarConfig cfg;
+    cfg.azimuth_samples = CFEAR_Radarodometry::DecodeBigEndian<uint16_t>(msg->azimuth_samples);
+    cfg.encoder_size = CFEAR_Radarodometry::DecodeBigEndian<uint16_t>(msg->encoder_size);
+    cfg.range_in_bins = CFEAR_Radarodometry::DecodeBigEndian<uint16_t>(msg->range_in_bins);
+
+    const double bin_size_raw = CFEAR_Radarodometry::DecodeBinSizeRawNativeEndian(msg->bin_size);
+    const double bin_size_scale = get_parameter("radar.legacy_bin_size_scale").as_double();
+    const float bin_size_m = static_cast<float>(bin_size_raw * bin_size_scale);
+    RCLCPP_INFO_ONCE(get_logger(),
+        "legacy_bytes radar config: raw bin_size register = %.4f, scale = %.6g -> range_res = %.4f m "
+        "(verify against the sensor's known range resolution; adjust radar.legacy_bin_size_scale if wrong)",
+        bin_size_raw, bin_size_scale, bin_size_m);
+    cfg.bin_size = bin_size_m > 0.0f
+        ? bin_size_m
+        : static_cast<float>(get_parameter("radar.range_res").as_double());
+
+    const uint16_t rotation_rate_raw = CFEAR_Radarodometry::DecodeBigEndian<uint16_t>(msg->expected_rotation_rate);
+    cfg.rotation_rate_hz = rotation_rate_raw > 0
+        ? static_cast<double>(rotation_rate_raw)
+        : get_parameter("radar.rotation_rate_hz").as_double();
+    HandleRadarConfig(cfg);
+  }
+
+  void HandleRadarConfig(const RadarConfig& cfg) {
     if (!pipeline_ready_) {
       RCLCPP_INFO(get_logger(),
                   "Radar configuration received: %u azimuths, encoder %u, %u bins, bin size %.4f m, %.1f Hz",
@@ -261,18 +327,34 @@ private:
   }
 
   void FftCallback(const navtech_msgs::msg::RadarFftDataMsg::SharedPtr msg) {
+    rclcpp::Time stamp(msg->header.stamp);
+    if (stamp.nanoseconds() == 0)
+      stamp = now(); // driver did not stamp the message
+    HandleFftAzimuth(msg->azimuth, msg->sweep_counter, msg->data.data(), msg->data.size(), stamp);
+  }
+
+  // legacy_bytes format: azimuth (encoder tick) and sweep_counter are 2-byte
+  // network-order fields, same semantics as navtech_msgs' plain uint16 fields;
+  // `data` is already the raw per-azimuth FFT bin vector (no metadata columns to
+  // strip). See legacy_radar_codec.h.
+  void FftCallbackLegacy(const messages::msg::RadarFftDataMessage::SharedPtr msg) {
+    rclcpp::Time stamp(msg->header.stamp);
+    if (stamp.nanoseconds() == 0)
+      stamp = now();
+    const uint16_t tick = CFEAR_Radarodometry::DecodeBigEndian<uint16_t>(msg->azimuth);
+    const uint16_t sweep = CFEAR_Radarodometry::DecodeBigEndian<uint16_t>(msg->sweep_counter);
+    HandleFftAzimuth(tick, sweep, msg->data.data(), msg->data.size(), stamp);
+  }
+
+  void HandleFftAzimuth(uint16_t azimuth_tick, uint16_t sweep_counter, const uint8_t* data,
+                        size_t len, const rclcpp::Time& stamp) {
     if (!pipeline_ready_) {
       RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
                            "FFT data received but radar configuration is still pending...");
       return;
     }
 
-    rclcpp::Time stamp(msg->header.stamp);
-    if (stamp.nanoseconds() == 0)
-      stamp = now(); // driver did not stamp the message
-
-    auto completed = assembler_.AddAzimuth(msg->azimuth, msg->sweep_counter,
-                                           msg->data.data(), msg->data.size(), stamp);
+    auto completed = assembler_.AddAzimuth(azimuth_tick, sweep_counter, data, len, stamp);
     if (!completed)
       return;
 
@@ -355,8 +437,11 @@ private:
   }
 
   // input
+  std::string message_format_ = "navtech_msgs";
   rclcpp::Subscription<navtech_msgs::msg::RadarFftDataMsg>::SharedPtr fft_sub_;
   rclcpp::Subscription<navtech_msgs::msg::RadarConfigurationMsg>::SharedPtr config_sub_;
+  rclcpp::Subscription<messages::msg::RadarFftDataMessage>::SharedPtr fft_sub_legacy_;
+  rclcpp::Subscription<messages::msg::RadarConfigurationMessage>::SharedPtr config_sub_legacy_;
   rclcpp::TimerBase::SharedPtr config_timeout_timer_;
 
   // pipeline

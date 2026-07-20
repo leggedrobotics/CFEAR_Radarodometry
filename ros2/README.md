@@ -1,20 +1,33 @@
 # CFEAR Radar Odometry — online ROS2 Jazzy port
 
 Online radar odometry from a live Navtech radar: subscribes the driver's
-**per-azimuth FFT messages** (`navtech_msgs/RadarFftDataMsg`, default topic
-`/radar_data/fft`), assembles full polar rotations, runs the CFEAR-3 pipeline
-in-process, and publishes `nav_msgs/Odometry` on **`/odometry`** (plus an
-optional `odom -> radar_link` TF).
+**per-azimuth FFT messages**, assembles full polar rotations, runs the
+CFEAR-3 pipeline in-process, and publishes `nav_msgs/Odometry` on
+**`/odometry`** (plus an optional `odom -> radar_link` TF).
+
+Two wire formats are supported, selected by `radar.message_format`:
+- `navtech_msgs` (default) — `navtech_msgs/RadarFftDataMsg` +
+  `RadarConfigurationMsg`, the official Navtech IA SDK messages (plain-typed
+  fields), default topic `/radar_data/fft`.
+- `legacy_bytes` — `messages/RadarFftDataMessage` + `RadarConfigurationMessage`,
+  the leggedrobotics `navtech_radar_ros` driver fork (every scalar field packed
+  as a network-order `uint8[]` byte array), default topic `/radar_data/fft_data`.
+  See [cfear_radarodometry_ros2/include/cfear_radarodometry/legacy_radar_codec.h](cfear_radarodometry_ros2/include/cfear_radarodometry/legacy_radar_codec.h)
+  for the decode and its caveats (`bin_size` in particular), and
+  [cfear_radarodometry_ros2/config/cfear3_b2w_ras3.yaml](cfear_radarodometry_ros2/config/cfear3_b2w_ras3.yaml)
+  for the b2w_rsl / RAS-3 preset. The two formats are NOT wire compatible with
+  each other.
 
 The ROS1 tree at the repository root is untouched — the offline Boreas
 pipeline in [../docker/](../docker/) keeps working as before.
 
 ```
 ros2/
-├── navtech_msgs/             vendored Navtech IA SDK messages (wire-identical)
+├── navtech_msgs/             vendored Navtech IA SDK messages (navtech_msgs format)
+├── messages/                 vendored navtech_radar_ros-fork messages (legacy_bytes format)
 ├── cfear_radarodometry_ros2/ the port: assembler + filter + registration + node
 ├── docker/                   Dockerfile (Jazzy), CycloneDDS config, run script
-└── tools/boreas_fft_replay.py  hardware-free end-to-end test from Boreas PNGs
+└── tools/boreas_fft_replay.py  hardware-free end-to-end test from Boreas PNGs (navtech_msgs format)
 ```
 
 ## Build & run (Docker)
@@ -54,6 +67,17 @@ parameters or just rely on the configuration message.
 
 Algorithm parameters are the CFEAR-3 set validated offline on Boreas
 (`cost_type P2P, submap 4, keyframe 1.5 m, res 3, k=40, z_min 60, Huber 0.1`).
+
+## b2w_rsl deployment (NavTech RAS-3, legacy_bytes)
+
+Run with `params_file:=$(ros2 pkg prefix --share cfear_radarodometry_ros2)/config/cfear3_b2w_ras3.yaml`
+against the leggedrobotics `navtech_radar_ros` fork's `/radar_data/fft_data` +
+`/radar_data/configuration_data` topics. This preset sets
+`radar.message_format: legacy_bytes` and publishes odometry on
+`/cfear/odometry` (not `/odometry` — `fognav_replay` also publishes there from
+dataset ground truth; never run both against the same topic). See the yaml's
+header comment for the geometry assumptions that still need hardware
+verification (`encoder_size`, `rotation_rate_hz`, `legacy_bin_size_scale`).
 
 ## Testing without hardware (Boreas replay)
 
@@ -107,9 +131,11 @@ row order, `fuser.radar_ccw`, `radar.range_res`).
 2. Config never arrives: some drivers publish it volatile-only — set
    `radar.config_durability: volatile` (you then need the driver started
    *after* this node, or rely on the parameter fallback).
-3. Old Navtech driver forks (`RadarFftDataMessage` with byte-array fields) are
-   **not wire compatible** with the vendored `navtech_msgs` (official SDK,
-   plain-typed fields). Such a driver needs a small translation node.
+3. Driver forks publishing `RadarFftDataMessage` with byte-array fields (e.g.
+   leggedrobotics' `navtech_radar_ros`) are **not wire compatible** with the
+   vendored `navtech_msgs` (official SDK, plain-typed fields) — set
+   `radar.message_format: legacy_bytes` (see above) instead of writing a
+   translation node.
 4. `radar_ccw`: if the live trajectory mirrors reality, flip `fuser.radar_ccw`.
 
 ## Notes vs the ROS1 code

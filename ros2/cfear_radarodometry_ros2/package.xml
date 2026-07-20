@@ -23,6 +23,7 @@
   <depend>cv_bridge</depend>
   <depend>angles</depend>
   <depend>navtech_msgs</depend>
+  <depend>messages</depend>
 
   <depend>libpcl-all-dev</depend>
   <depend>libopencv-dev</depend>
