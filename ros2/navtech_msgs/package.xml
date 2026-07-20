@@ -1,0 +1,26 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>navtech_msgs</name>
+  <version>1.0.0</version>
+  <description>
+    Vendored copy of the Navtech IA SDK ROS2 message definitions
+    (bitbucket.org/navtechradar/iasdk-public, ros/ros2/src/navtech_msgs).
+    Kept wire-identical to the official driver's package so subscriptions match.
+  </description>
+  <maintainer email="cedric.keller@hispeed.ch">Cedric Keller</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <buildtool_depend>rosidl_default_generators</buildtool_depend>
+
+  <depend>std_msgs</depend>
+  <depend>sensor_msgs</depend>
+
+  <exec_depend>rosidl_default_runtime</exec_depend>
+  <member_of_group>rosidl_interface_packages</member_of_group>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

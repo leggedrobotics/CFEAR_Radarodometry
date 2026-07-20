@@ -1,0 +1,37 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>cfear_radarodometry_ros2</name>
+  <version>1.0.0</version>
+  <description>
+    Online ROS2 port of CFEAR Radarodometry: subscribes per-azimuth Navtech FFT
+    messages, assembles polar scans, and publishes nav_msgs/Odometry.
+  </description>
+  <maintainer email="cedric.keller@hispeed.ch">Cedric Keller</maintainer>
+  <license>BSD-3-Clause</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>tf2</depend>
+  <depend>tf2_ros</depend>
+  <depend>tf2_eigen</depend>
+  <depend>pcl_conversions</depend>
+  <depend>cv_bridge</depend>
+  <depend>angles</depend>
+  <depend>navtech_msgs</depend>
+
+  <depend>libpcl-all-dev</depend>
+  <depend>libopencv-dev</depend>
+  <depend>eigen</depend>
+  <depend>libceres-dev</depend>
+
+  <exec_depend>ros2launch</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

@@ -1,0 +1,62 @@
+# CFEAR-3 parameters (best accuracy), tuned for a Boreas-like Navtech CIR204-H:
+# same values as the ROS1 offline pipeline in docker/run_boreas.sh.
+# radar.* geometry values are only the FALLBACK - the driver's
+# RadarConfigurationMsg overrides them when it arrives.
+cfear_odometry_node:
+  ros__parameters:
+    radar:
+      fft_topic: /radar_data/fft
+      config_topic: /radar_data/configuration_data
+      fft_reliability: best_effort      # must match the radar driver's publisher QoS
+      config_durability: transient_local
+      config_timeout_sec: 5.0
+      azimuth_samples: 400
+      encoder_size: 5600
+      range_in_bins: 3768
+      range_res: 0.0596                 # m/bin; CIR204-H (Oxford CTS350-X: 0.0438)
+      rotation_rate_hz: 4.0
+      max_missing_fraction: 0.25        # drop scans missing more azimuths than this
+      min_filtered_points: 20
+      stamp_source: first_azimuth       # first_azimuth | last_azimuth | now
+
+    driver:
+      z_min: 60.0
+      k_strongest: 40
+      min_distance: 2.5
+      filter_type: kstrong              # kstrong | CA-CFAR
+      publish_filtered: false           # debug: publish filtered cloud as PointCloud2
+      filtered_topic: radar_filtered
+
+    fuser:
+      cost_type: P2P
+      loss_type: Huber
+      loss_limit: 0.1
+      weight_option: 4
+      weight_intensity: true
+      res: 3.0
+      submap_scan_size: 4
+      registered_min_keyframe_dist: 1.5
+      min_keyframe_rot_deg: 5.0
+      use_keyframe: true
+      use_guess: true
+      compensate: true
+      radar_ccw: true                   # validated on Boreas (matches the ROS1 reference
+                                        # run); flip if the trajectory comes out mirrored
+      covar_scale: 1.0
+      regularization: 0.0
+      soft_constraint: false
+      disable_registration: false
+      downsample_factor: 1.0
+      store_graph: false
+
+    out:
+      odom_topic: /odometry
+      odom_keyframe_topic: /odometry_keyframe
+      registered_cloud_topic: radar_registered
+      registered_keyframe_cloud_topic: radar_registered_keyframe
+      publish_registered_cloud: true
+      publish_tf: true
+
+    frames:
+      odom_frame: odom
+      radar_frame: radar_link
