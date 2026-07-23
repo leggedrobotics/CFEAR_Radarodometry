@@ -17,6 +17,13 @@ struct RadarConfig {
   uint16_t range_in_bins = 3768;   // cols of the assembled polar scan
   float bin_size = 0.0596f;        // range resolution [m]
   double rotation_rate_hz = 4.0;
+  // polar_image input only (leggedrobotics RadarConfigurationMsg extension):
+  // leading per-row metadata columns (Oxford/Boreas 11-byte layout) and the
+  // range crop [start_bin, end_bin) the published image covers. end_bin == 0
+  // means unknown (uncropped / config not received).
+  uint16_t metadata_columns = 0;
+  uint16_t start_bin = 0;
+  uint16_t end_bin = 0;
 };
 
 struct CompletedScan {

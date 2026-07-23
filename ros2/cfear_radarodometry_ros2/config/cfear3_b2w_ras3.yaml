@@ -1,43 +1,36 @@
-# CFEAR-3 parameters for the b2w_rsl deployment: NavTech RAS-3, published by the
-# leggedrobotics navtech_radar_ros driver fork on /radar_data/fft_data and
-# /radar_data/configuration_data (byte-array wire format -> message_format:
-# legacy_bytes, see legacy_radar_codec.h).
+# CFEAR-3 parameters for the b2w_rsl deployment: NavTech RAS-3, published as
+# whole-rotation polar images by the leggedrobotics navtech_radar_sdk
+# polar_image_publisher on /radar_data/radar_frame (sensor_msgs/Image, mono8,
+# rows=azimuths, leading 11 Oxford/Boreas metadata columns per row) with a
+# latched navtech_msgs/RadarConfigurationMsg on /radar_data/configuration_data.
+# radarsplat_replay's "frames" mode publishes the same interface, so this config
+# also works against dataset replay (then prefer stamp_source: header -- the
+# replayed metadata carries dataset-era time while /odometry is stamped now()).
 #
-# radar.* geometry values are only the FALLBACK, used until the driver's
-# RadarConfigurationMessage arrives (radar.config_timeout_sec). They come from
-# the RSL RAS-3 setup description (H=400, W=3371, range_resolution=0.0596) and
-# are UNVERIFIED against the real sensor - nobody has run this against
-# hardware yet. In particular:
-#   - encoder_size below is a placeholder equal to azimuth_samples (we were
-#     only given the coarse azimuth_resolution=0.9deg, not the sensor's actual
-#     encoder tick count e.g. 5600 on other Navtech units) - harmless as long
-#     as the live configuration message arrives before config_timeout_sec.
-#   - rotation_rate_hz keeps the Boreas default (4 Hz); not confirmed for RAS-3.
-#   - legacy_bin_size_scale assumes the driver's raw bin_size register is in
-#     units of 1/10000 m (matches range_resolution=0.0596 <-> raw ~596); verify
-#     against the RCLCPP_INFO_ONCE log line the node prints on first config.
+# radar.* geometry values are only the FALLBACK, used if no configuration
+# message arrives within radar.config_timeout_sec. They match the real RAS-3
+# (native 1712 bins x 0.040307827 m = 69 m) as cropped by the driver's default
+# start_bin 0 / end_bin 497 (~20 m).
 # The CFEAR-3 algorithm parameters (driver/fuser/out) are carried over
 # unchanged from cfear3_boreas.yaml (Boreas-validated); re-tune once real RAS-3
 # trajectories are available.
 cfear_odometry_node:
   ros__parameters:
     radar:
-      message_format: legacy_bytes      # navtech_radar_ros driver fork (byte-array messages)
-      fft_topic: /radar_data/fft_data
+      message_format: polar_image       # navtech_radar_sdk polar_image_publisher / replay frames
+      image_topic: /radar_data/radar_frame
       config_topic: /radar_data/configuration_data
-      fft_reliability: reliable         # driver publishes both topics RELIABLE, not best_effort
-      config_durability: volatile       # driver does NOT set transient_local - start this node
-                                        # before/with the driver, or restart the driver after
+      config_durability: transient_local  # driver publishes the config latched
       config_timeout_sec: 5.0
+      metadata_columns: 11              # fallback only; announced in the config msg
       azimuth_samples: 400
-      encoder_size: 400                 # placeholder fallback only, see header comment
-      range_in_bins: 3371
-      range_res: 0.0596                 # m/bin
-      rotation_rate_hz: 4.0             # unverified for RAS-3, see header comment
-      legacy_bin_size_scale: 1.0e-4     # unverified assumption, see header comment
+      encoder_size: 5600
+      range_in_bins: 497                # cropped image width (native 1712 bins = 69 m)
+      range_res: 0.040307827            # m/bin (RAS-3 bin size)
+      rotation_rate_hz: 4.0
       max_missing_fraction: 0.25        # drop scans missing more azimuths than this
       min_filtered_points: 20
-      stamp_source: first_azimuth       # first_azimuth | last_azimuth | now
+      stamp_source: first_azimuth       # first_azimuth | last_azimuth | now | header
 
     driver:
       z_min: 60.0

@@ -14,8 +14,15 @@ Two wire formats are supported, selected by `radar.message_format`:
   as a network-order `uint8[]` byte array), default topic `/radar_data/fft_data`.
   See [cfear_radarodometry_ros2/include/cfear_radarodometry/legacy_radar_codec.h](cfear_radarodometry_ros2/include/cfear_radarodometry/legacy_radar_codec.h)
   for the decode and its caveats (`bin_size` in particular), and
-  [cfear_radarodometry_ros2/config/cfear3_b2w_ras3.yaml](cfear_radarodometry_ros2/config/cfear3_b2w_ras3.yaml)
-  for the b2w_rsl / RAS-3 preset. The two formats are NOT wire compatible with
+  [cfear_radarodometry_ros2/config/cfear3_b2w_legacy_spokes.yaml](cfear_radarodometry_ros2/config/cfear3_b2w_legacy_spokes.yaml)
+  for the preset (kept for `radarsplat_replay`'s spokes mode).
+- `polar_image` — `sensor_msgs/Image` whole-rotation polar frames (mono8,
+  rows=azimuths, leading 11 Oxford/Boreas metadata columns per row) from the
+  leggedrobotics `navtech_radar_sdk` `polar_image_publisher` or
+  `radarsplat_replay`'s frames mode, default topic `/radar_data/radar_frame`,
+  with a latched `navtech_msgs/RadarConfigurationMsg` announcing the layout.
+  See [cfear_radarodometry_ros2/config/cfear3_b2w_ras3.yaml](cfear_radarodometry_ros2/config/cfear3_b2w_ras3.yaml)
+  for the b2w_rsl / RAS-3 preset. The formats are NOT wire compatible with
   each other.
 
 The ROS1 tree at the repository root is untouched — the offline Boreas
@@ -68,16 +75,17 @@ parameters or just rely on the configuration message.
 Algorithm parameters are the CFEAR-3 set validated offline on Boreas
 (`cost_type P2P, submap 4, keyframe 1.5 m, res 3, k=40, z_min 60, Huber 0.1`).
 
-## b2w_rsl deployment (NavTech RAS-3, legacy_bytes)
+## b2w_rsl deployment (NavTech RAS-3, polar_image)
 
 Run with `params_file:=$(ros2 pkg prefix --share cfear_radarodometry_ros2)/config/cfear3_b2w_ras3.yaml`
-against the leggedrobotics `navtech_radar_ros` fork's `/radar_data/fft_data` +
-`/radar_data/configuration_data` topics. This preset sets
-`radar.message_format: legacy_bytes` and publishes odometry on
+against the leggedrobotics `navtech_radar_sdk` driver's
+`/radar_data/radar_frame` + `/radar_data/configuration_data` topics. This
+preset sets `radar.message_format: polar_image` and publishes odometry on
 `/cfear/odometry` (not `/odometry` — `fognav_replay` also publishes there from
-dataset ground truth; never run both against the same topic). See the yaml's
-header comment for the geometry assumptions that still need hardware
-verification (`encoder_size`, `rotation_rate_hz`, `legacy_bin_size_scale`).
+dataset ground truth; never run both against the same topic). Against dataset
+replay, prefer `radar.stamp_source: header` (replayed metadata carries
+dataset-era time). The legacy spoke preset lives on as
+`cfear3_b2w_legacy_spokes.yaml`.
 
 ## Testing without hardware (Boreas replay)
 

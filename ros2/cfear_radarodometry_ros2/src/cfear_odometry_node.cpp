@@ -6,16 +6,23 @@
  *     -> radarDriver (k-strongest filtering -> point clouds)
  *     -> OdometryKeyframeFuser (CFEAR registration -> nav_msgs/Odometry on /odometry [+ tf])
  *
- * Two wire formats are supported, selected by radar.message_format:
- *   - "navtech_msgs" (default): navtech_msgs/RadarFftDataMsg + RadarConfigurationMsg,
+ * Three wire formats are supported, selected by radar.message_format:
+ *   - "polar_image": sensor_msgs/Image whole-rotation polar frames (mono8,
+ *     rows=azimuths) from the leggedrobotics navtech_radar_sdk
+ *     polar_image_publisher or radarsplat_replay, with the Oxford/Boreas
+ *     11-column per-row metadata prefix (bytes 0-7 uint64 LE UNIX time [us],
+ *     bytes 8-9 uint16 LE encoder tick, byte 10 valid flag). The
+ *     FftRotationAssembler is bypassed; the image is the assembled scan.
+ *   - "navtech_msgs": navtech_msgs/RadarFftDataMsg + RadarConfigurationMsg,
  *     the official Navtech IA SDK messages (plain-typed fields).
  *   - "legacy_bytes": messages/RadarFftDataMessage + RadarConfigurationMessage, the
- *     leggedrobotics navtech_radar_ros driver fork (every scalar field packed as a
+ *     old navtech_radar_ros driver fork (every scalar field packed as a
  *     network-order uint8[] byte array). See legacy_radar_codec.h for the decode.
  *
- * Radar geometry (azimuth samples, encoder size, range bins, bin size) is taken
- * from the driver's radar configuration message when available; after
- * radar.config_timeout_sec it falls back to the radar.* parameters.
+ * Radar geometry (azimuth samples, encoder size, range bins, bin size, and for
+ * polar_image the metadata columns + range crop) is taken from the driver's
+ * radar configuration message when available; after radar.config_timeout_sec
+ * it falls back to the radar.* parameters.
  */
 #include <atomic>
 #include <condition_variable>
@@ -31,6 +38,7 @@
 #include <messages/msg/radar_fft_data_message.hpp>
 #include <navtech_msgs/msg/radar_configuration_msg.hpp>
 #include <navtech_msgs/msg/radar_fft_data_msg.hpp>
+#include <sensor_msgs/msg/image.hpp>
 
 #include "cfear_radarodometry/fft_assembler.h"
 #include "cfear_radarodometry/legacy_radar_codec.h"
@@ -51,7 +59,8 @@ public:
     const std::string fft_topic = get_parameter("radar.fft_topic").as_string();
     const std::string config_topic = get_parameter("radar.config_topic").as_string();
     message_format_ = get_parameter("radar.message_format").as_string();
-    if (message_format_ != "navtech_msgs" && message_format_ != "legacy_bytes") {
+    if (message_format_ != "navtech_msgs" && message_format_ != "legacy_bytes" &&
+        message_format_ != "polar_image") {
       RCLCPP_WARN(get_logger(), "Unknown radar.message_format '%s' - falling back to 'navtech_msgs'",
                   message_format_.c_str());
       message_format_ = "navtech_msgs";
@@ -77,6 +86,17 @@ public:
       config_sub_legacy_ = create_subscription<messages::msg::RadarConfigurationMessage>(
           config_topic, config_qos,
           std::bind(&CfearOdometryNode::ConfigCallbackLegacy, this, std::placeholders::_1));
+    } else if (message_format_ == "polar_image") {
+      // Whole assembled rotations at a few Hz - a shallow reliable queue
+      // matching the driver/replay frame publishers is enough.
+      rclcpp::QoS image_qos(rclcpp::KeepLast(5));
+      image_qos.reliable();
+      image_sub_ = create_subscription<sensor_msgs::msg::Image>(
+          get_parameter("radar.image_topic").as_string(), image_qos,
+          std::bind(&CfearOdometryNode::ImageCallback, this, std::placeholders::_1));
+      config_sub_ = create_subscription<navtech_msgs::msg::RadarConfigurationMsg>(
+          config_topic, config_qos,
+          std::bind(&CfearOdometryNode::ConfigCallback, this, std::placeholders::_1));
     } else {
       fft_sub_ = create_subscription<navtech_msgs::msg::RadarFftDataMsg>(
           fft_topic, fft_qos,
@@ -93,12 +113,17 @@ public:
 
     worker_ = std::thread(&CfearOdometryNode::WorkerLoop, this);
 
-    RCLCPP_INFO(get_logger(),
-                "Listening for FFT data on '%s' (%s, format=%s), radar configuration on '%s'",
-                fft_topic.c_str(),
-                get_parameter("radar.fft_reliability").as_string().c_str(),
-                message_format_.c_str(),
-                config_topic.c_str());
+    if (message_format_ == "polar_image")
+      RCLCPP_INFO(get_logger(),
+                  "Listening for polar radar frames on '%s' (reliable), radar configuration on '%s'",
+                  get_parameter("radar.image_topic").as_string().c_str(), config_topic.c_str());
+    else
+      RCLCPP_INFO(get_logger(),
+                  "Listening for FFT data on '%s' (%s, format=%s), radar configuration on '%s'",
+                  fft_topic.c_str(),
+                  get_parameter("radar.fft_reliability").as_string().c_str(),
+                  message_format_.c_str(),
+                  config_topic.c_str());
   }
 
   ~CfearOdometryNode() override {
@@ -121,10 +146,16 @@ private:
     declare_parameter<std::string>("radar.fft_reliability", "best_effort"); // or "reliable"
     declare_parameter<std::string>("radar.config_durability", "transient_local"); // or "volatile"
     declare_parameter<double>("radar.config_timeout_sec", 5.0);
-    // "navtech_msgs" (official Navtech IA SDK, plain-typed fields) or
-    // "legacy_bytes" (leggedrobotics navtech_radar_ros fork, byte-array fields -
-    // see legacy_radar_codec.h). The two are NOT wire compatible with each other.
+    // "polar_image" (sensor_msgs/Image whole rotations from the
+    // navtech_radar_sdk polar_image_publisher / radarsplat_replay),
+    // "navtech_msgs" (official Navtech IA SDK, plain-typed spoke fields) or
+    // "legacy_bytes" (old navtech_radar_ros fork, byte-array spoke fields -
+    // see legacy_radar_codec.h). The formats are NOT wire compatible.
     declare_parameter<std::string>("radar.message_format", "navtech_msgs");
+    // polar_image only: frame topic and the metadata-column fallback used when
+    // no RadarConfigurationMsg announces the layout within the timeout.
+    declare_parameter<std::string>("radar.image_topic", "/radar_data/radar_frame");
+    declare_parameter<int>("radar.metadata_columns", 11);
     // legacy_bytes only: raw-bin_size-register -> metres scale factor, see
     // legacy_radar_codec.h::DecodeBinSizeRawNativeEndian for why this is needed
     // and why it is an unconfirmed assumption.
@@ -136,7 +167,10 @@ private:
     declare_parameter<double>("radar.rotation_rate_hz", 4.0);
     declare_parameter<double>("radar.max_missing_fraction", 0.25);
     declare_parameter<int>("radar.min_filtered_points", 20);
-    declare_parameter<std::string>("radar.stamp_source", "first_azimuth"); // first_azimuth|last_azimuth|now
+    // first_azimuth|last_azimuth|now. polar_image only: also "header" (use the
+    // frame publisher's header stamp instead of the embedded metadata times --
+    // needed when replaying datasets whose metadata carries dataset-era time).
+    declare_parameter<std::string>("radar.stamp_source", "first_azimuth");
 
     // filtering (radarDriver)
     declare_parameter<double>("driver.z_min", 60.0);
@@ -185,6 +219,7 @@ private:
     cfg.range_in_bins = static_cast<uint16_t>(get_parameter("radar.range_in_bins").as_int());
     cfg.bin_size = static_cast<float>(get_parameter("radar.range_res").as_double());
     cfg.rotation_rate_hz = get_parameter("radar.rotation_rate_hz").as_double();
+    cfg.metadata_columns = static_cast<uint16_t>(get_parameter("radar.metadata_columns").as_int());
     return cfg;
   }
 
@@ -199,6 +234,10 @@ private:
     cfg.rotation_rate_hz = msg->expected_rotation_rate > 0
         ? static_cast<double>(msg->expected_rotation_rate)
         : get_parameter("radar.rotation_rate_hz").as_double();
+    // Image-layout fields (leggedrobotics extension; zero from stock drivers).
+    cfg.metadata_columns = msg->metadata_columns;
+    cfg.start_bin = msg->start_bin;
+    cfg.end_bin = msg->end_bin;
     HandleRadarConfig(cfg);
   }
 
@@ -357,17 +396,102 @@ private:
     auto completed = assembler_.AddAzimuth(azimuth_tick, sweep_counter, data, len, stamp);
     if (!completed)
       return;
+    EnqueueScan(std::move(*completed));
+  }
 
-    if (completed->missing_azimuths > max_missing_) {
-      RCLCPP_WARN(get_logger(),
-                  "Dropping scan: %d/%u azimuths missing (max allowed %d) - check FFT topic QoS/bandwidth",
-                  completed->missing_azimuths, active_config_.azimuth_samples, max_missing_);
+  // Decode the Oxford/Boreas per-row metadata timestamp: bytes 0-7 uint64
+  // little-endian UNIX time in microseconds.
+  static uint64_t RowTimestampUs(const cv::Mat& img, int row) {
+    const uint8_t* p = img.ptr<uint8_t>(row);
+    uint64_t us = 0;
+    for (int i = 7; i >= 0; i--)
+      us = (us << 8) | p[i];
+    return us;
+  }
+
+  // polar_image format: the frame IS the assembled scan. Strip the embedded
+  // per-row metadata columns and decode them for stamps + row validity; the
+  // FftRotationAssembler is bypassed entirely.
+  void ImageCallback(const sensor_msgs::msg::Image::SharedPtr msg) {
+    if (!pipeline_ready_) {
+      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
+                           "Radar frame received but radar configuration is still pending...");
       return;
     }
-    if (completed->missing_azimuths > 0)
+
+    const int h = static_cast<int>(msg->height);
+    const int w = static_cast<int>(msg->width);
+    const int meta = active_config_.metadata_columns;
+    if (h <= 0 || w <= meta) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                           "Radar frame %dx%d not wider than %d metadata columns - dropping", h, w, meta);
+      return;
+    }
+    if (active_config_.end_bin > active_config_.start_bin) {
+      const int expected = meta + active_config_.end_bin - active_config_.start_bin;
+      if (w != expected)
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                             "Radar frame width %d != %d announced by the radar configuration "
+                             "(metadata %d + bins [%u, %u))",
+                             w, expected, meta, active_config_.start_bin, active_config_.end_bin);
+    }
+
+    const cv::Mat full(h, w, CV_8UC1, const_cast<uint8_t*>(msg->data.data()),
+                       msg->step > 0 ? static_cast<size_t>(msg->step) : static_cast<size_t>(w));
+
+    CompletedScan scan;
+    scan.polar = full.colRange(meta, w).clone();
+
+    rclcpp::Time header_stamp(msg->header.stamp);
+    if (header_stamp.nanoseconds() == 0)
+      header_stamp = now();
+
+    if (meta >= 11) {
+      int first_valid = -1, last_valid = -1, missing = 0;
+      for (int r = 0; r < h; r++) {
+        if (full.ptr<uint8_t>(r)[10] == 255) {
+          if (first_valid < 0)
+            first_valid = r;
+          last_valid = r;
+        } else {
+          missing++;
+        }
+      }
+      scan.missing_azimuths = missing;
+      if (first_valid >= 0 && stamp_source_ != "header") {
+        scan.stamp_first = rclcpp::Time(
+            static_cast<int64_t>(RowTimestampUs(full, first_valid)) * 1000, RCL_ROS_TIME);
+        scan.stamp_last = rclcpp::Time(
+            static_cast<int64_t>(RowTimestampUs(full, last_valid)) * 1000, RCL_ROS_TIME);
+      } else {
+        scan.stamp_first = header_stamp;
+        scan.stamp_last = header_stamp;
+      }
+    } else {
+      // No embedded metadata: synthesize the rotation span from the header
+      // stamp and the configured rotation rate.
+      scan.missing_azimuths = 0;
+      scan.stamp_first = header_stamp;
+      const double rate =
+          active_config_.rotation_rate_hz > 0 ? active_config_.rotation_rate_hz : 4.0;
+      scan.stamp_last =
+          header_stamp + rclcpp::Duration::from_seconds((h - 1.0) / (h * rate));
+    }
+
+    EnqueueScan(std::move(scan));
+  }
+
+  void EnqueueScan(CompletedScan&& completed) {
+    if (completed.missing_azimuths > max_missing_) {
+      RCLCPP_WARN(get_logger(),
+                  "Dropping scan: %d/%u azimuths missing (max allowed %d) - check FFT topic QoS/bandwidth",
+                  completed.missing_azimuths, active_config_.azimuth_samples, max_missing_);
+      return;
+    }
+    if (completed.missing_azimuths > 0)
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
                            "Assembled scan misses %d azimuths (dropped FFT messages)",
-                           completed->missing_azimuths);
+                           completed.missing_azimuths);
 
     // Hand over to the worker; drop the previous scan if registration is still
     // busy - bounded latency beats an ever-growing queue, and the constant-
@@ -380,7 +504,7 @@ private:
                              "Registration cannot keep up - dropped %lu scans so far",
                              static_cast<unsigned long>(dropped_scans_));
       }
-      pending_ = std::move(*completed);
+      pending_ = std::move(completed);
     }
     cv_.notify_one();
   }
@@ -442,6 +566,7 @@ private:
   rclcpp::Subscription<navtech_msgs::msg::RadarConfigurationMsg>::SharedPtr config_sub_;
   rclcpp::Subscription<messages::msg::RadarFftDataMessage>::SharedPtr fft_sub_legacy_;
   rclcpp::Subscription<messages::msg::RadarConfigurationMessage>::SharedPtr config_sub_legacy_;
+  rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr image_sub_;
   rclcpp::TimerBase::SharedPtr config_timeout_timer_;
 
   // pipeline
