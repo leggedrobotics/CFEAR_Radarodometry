@@ -30,6 +30,10 @@
 
 #include <navtech_msgs/msg/radar_configuration_msg.hpp>
 #include <sensor_msgs/msg/image.hpp>
+#include <tf2_eigen/tf2_eigen.hpp>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_broadcaster.h>
+#include <tf2_ros/transform_listener.h>
 
 #include "cfear_radarodometry/odometrykeyframefuser.h"
 #include "cfear_radarodometry/radar_driver.h"
@@ -107,6 +111,27 @@ private:
     // recordings that were published at full range; every downstream stage
     // (k-strongest, surface points, registration) scales with the bin count.
     declare_parameter<int>("radar.max_range_bins", 0);
+    // Reverse the azimuth ROW ORDER of every scan before it reaches the driver.
+    //
+    // radar_filters.cpp maps row -> bearing as theta = (row+1)/rows * 2*pi with
+    // x = r*cos(theta), y = r*sin(theta): azimuth index increasing means
+    // COUNTER-clockwise. That holds for Boreas, whose radar frame is z-down, but
+    // the RAS-3 on b2w is read in a REP-103 frame (x fwd, y left, z UP) where the
+    // very same physical rotation runs CLOCKWISE - the encoder tick increases with
+    // a NEGATIVE bearing. Feeding it in unreversed reflects every scan about the
+    // x axis, and because scan matching is equivariant under reflection the
+    // odometry comes out self-consistent but mirrored: y -> -y, yaw -> -yaw.
+    // (Measured on hg_nav_4: CFEAR net yaw +50.4 deg vs the DLIO reference's
+    // -49.30 deg - right magnitude, wrong sign.)
+    //
+    // Reversing the rows is exact: row r -> rows-1-r gives
+    // theta = 2*pi*(rows-r)/rows == -2*pi*r/rows, which is the clockwise mapping
+    // AND cancels the upstream +1, removing its one-row (0.9 deg) bearing bias.
+    //
+    // NOTE this also reverses how acquisition time maps to bearing, so it must be
+    // paired with the opposite fuser.radar_ccw - see that parameter.
+    // Default false = upstream/Boreas behaviour; the b2w preset turns it on.
+    declare_parameter<bool>("radar.reverse_azimuths", false);
     declare_parameter<int>("radar.azimuth_samples", 400);
     declare_parameter<int>("radar.encoder_size", 5600);
     declare_parameter<int>("radar.range_in_bins", 3768);
@@ -146,6 +171,14 @@ private:
     declare_parameter<bool>("fuser.use_keyframe", true);
     declare_parameter<bool>("fuser.use_guess", true);
     declare_parameter<bool>("fuser.compensate", true);
+    // Motion-compensation (deskew) direction ONLY - it can never mirror the
+    // output. Compensate() derives each point's acquisition time from its
+    // bearing (GetRelTimeStamp: rel = +-(atan2(y,x)/2pi - 0.5)) and unwinds the
+    // previous scan's motion by that fraction, so the sign must match how time
+    // maps to bearing: false when bearing grows with time, true when it shrinks.
+    // radar.reverse_azimuths flips that mapping, so the two parameters must move
+    // together. Not cosmetic: on hg_nav_4 the two settings differ by 0.98 m in
+    // position, 5.2 deg in yaw and 4.2 m in path length.
     declare_parameter<bool>("fuser.radar_ccw", false);
     declare_parameter<double>("fuser.covar_scale", 1.0);
     declare_parameter<double>("fuser.regularization", 0.0);
@@ -163,6 +196,21 @@ private:
     declare_parameter<bool>("out.publish_tf", true);
     declare_parameter<std::string>("frames.odom_frame", "odom");
     declare_parameter<std::string>("frames.radar_frame", "radar_link");
+    // When non-empty, publish odom_frame -> THIS frame instead of
+    // odom_frame -> radar_frame, composing the estimate with radar_frame <-
+    // tf_body_frame looked up from tf2 (normally the static radar mount
+    // extrinsic, published by the driver container).
+    //
+    // Needed whenever something else already owns radar_frame in the TF tree: on
+    // b2w the navtech_radar entrypoint publishes a static lidar -> radar_link, so
+    // a second dynamic odom -> radar_link would give radar_link two parents and
+    // make every tf2 lookup - rviz, "2D Goal Pose", the nav stack - depend on
+    // which message arrived last. Retargeting the child to the robot root keeps
+    // one parent per frame and matches the usual odom -> base convention.
+    //
+    // The odometry TOPIC is unaffected: it still carries the RADAR pose, which is
+    // what radarsplat consumes. Empty = upstream behaviour (odom -> radar_frame).
+    declare_parameter<std::string>("frames.tf_body_frame", "");
 
     // Log one machine-readable line per processed scan (stage times, point
     // counts, drop counter) so a replay can be profiled without a debugger.
@@ -272,9 +320,25 @@ private:
     fuser_par.scan_registered_latest_topic = get_parameter("out.registered_cloud_topic").as_string();
     fuser_par.scan_registered_keyframe_topic = get_parameter("out.registered_keyframe_cloud_topic").as_string();
     fuser_par.visualize = get_parameter("out.publish_registered_cloud").as_bool();
-    fuser_par.publish_tf_ = get_parameter("out.publish_tf").as_bool();
     fuser_par.odometry_link_id = get_parameter("frames.odom_frame").as_string();
     fuser_par.child_frame_id = get_parameter("frames.radar_frame").as_string();
+
+    odom_frame_ = fuser_par.odometry_link_id;
+    radar_frame_ = fuser_par.child_frame_id;
+    tf_body_frame_ = get_parameter("frames.tf_body_frame").as_string();
+    const bool publish_tf = get_parameter("out.publish_tf").as_bool();
+    // The fuser only knows how to broadcast odom -> radar. When a body frame is
+    // requested the node does the broadcasting itself (see PublishBodyTf), so the
+    // fuser must stay quiet or radar_frame ends up with two parents anyway.
+    fuser_par.publish_tf_ = publish_tf && tf_body_frame_.empty();
+    if (publish_tf && !tf_body_frame_.empty()) {
+      tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
+      tf_buffer_ = std::make_unique<tf2_ros::Buffer>(get_clock());
+      tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_, this, true);
+      RCLCPP_INFO(get_logger(), "Broadcasting %s -> %s (estimate composed with %s <- %s from tf2)",
+                  odom_frame_.c_str(), tf_body_frame_.c_str(), radar_frame_.c_str(),
+                  tf_body_frame_.c_str());
+    }
     CFEAR_Radarodometry::MapPointNormal::downsample_factor =
         get_parameter("fuser.downsample_factor").as_double();
 
@@ -293,7 +357,15 @@ private:
                                     * cfg.azimuth_samples);
     min_filtered_points_ = static_cast<size_t>(get_parameter("radar.min_filtered_points").as_int());
     max_range_bins_ = static_cast<int>(get_parameter("radar.max_range_bins").as_int());
+    reverse_azimuths_ = get_parameter("radar.reverse_azimuths").as_bool();
     log_scan_timing_ = get_parameter("debug.log_scan_timing").as_bool();
+
+    // Reversing the rows reverses time-vs-bearing, so the deskew sign must follow.
+    if (fuser_par.compensate && fuser_par.radar_ccw != reverse_azimuths_)
+      RCLCPP_WARN(get_logger(),
+                  "radar.reverse_azimuths=%s with fuser.radar_ccw=%s deskews scans BACKWARDS "
+                  "(it adds the motion smear instead of removing it). The two must match.",
+                  reverse_azimuths_ ? "true" : "false", fuser_par.radar_ccw ? "true" : "false");
     stamp_source_ = get_parameter("radar.stamp_source").as_string();
 
     active_config_ = cfg;
@@ -440,9 +512,17 @@ private:
     else if (stamp_source_ == "now")
       stamp = now();
 
+    // Clockwise sensor -> REP-103 bearings. The single seam where every scan
+    // passes, and it must happen before ProcessPolarImage: radar_filters.cpp is
+    // hardcoded counter-clockwise. See radar.reverse_azimuths. Row order is used
+    // for nothing else here - missing_azimuths is a count, and the stamps were
+    // read from the metadata columns of the unreversed frame, so both stay right.
+    if (reverse_azimuths_)
+      cv::flip(scan.polar, scan.polar, 0);
+
     auto polar = std::make_shared<cv_bridge::CvImage>();
     polar->header.stamp = stamp;
-    polar->header.frame_id = get_parameter("frames.radar_frame").as_string();
+    polar->header.frame_id = radar_frame_;
     polar->encoding = "mono8";
     polar->image = scan.polar;
 
@@ -482,8 +562,52 @@ private:
                   static_cast<unsigned long>(dropped_scans_.load()));
     }
 
+    PublishBodyTf(Tcurr, stamp);
+
     RCLCPP_DEBUG(get_logger(), "pose: x=%.2f y=%.2f", Tcurr.translation().x(),
                  Tcurr.translation().y());
+  }
+
+  /* Broadcast odom_frame -> tf_body_frame for the pose the fuser just produced.
+   *
+   * Tcurr is odom <- radar_frame, so the body pose is Tcurr * (radar_frame <-
+   * tf_body_frame). That second factor is the static mount extrinsic; it is
+   * looked up once and cached, since re-reading a latched static transform every
+   * scan buys nothing. Until it shows up (the driver publishes /tf_static at its
+   * own pace) no TF is emitted - a wrong tree is worse than a late one.
+   *
+   * Note the body pose inherits the radar's height: CFEAR estimates a planar
+   * pose AT THE SENSOR, so the body lands one mount height below the odom plane
+   * (-0.4525 m on b2w). That is the honest reading of a radar-only estimate, and
+   * rviz is happy with it.
+   */
+  void PublishBodyTf(const Eigen::Affine3d& Tcurr, const rclcpp::Time& stamp) {
+    if (tf_broadcaster_ == nullptr)
+      return;
+
+    if (!have_radar_from_body_) {
+      try {
+        T_radar_body_ = tf2::transformToEigen(
+            tf_buffer_->lookupTransform(radar_frame_, tf_body_frame_, tf2::TimePointZero));
+        have_radar_from_body_ = true;
+        RCLCPP_INFO(get_logger(), "Resolved %s <- %s: (%.3f, %.3f, %.3f) m", radar_frame_.c_str(),
+                    tf_body_frame_.c_str(), T_radar_body_.translation().x(),
+                    T_radar_body_.translation().y(), T_radar_body_.translation().z());
+      } catch (const tf2::TransformException& ex) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                             "No %s <- %s yet, not broadcasting %s -> %s: %s", radar_frame_.c_str(),
+                             tf_body_frame_.c_str(), odom_frame_.c_str(), tf_body_frame_.c_str(),
+                             ex.what());
+        return;
+      }
+    }
+
+    geometry_msgs::msg::TransformStamped tf =
+        tf2::eigenToTransform(Eigen::Isometry3d(Tcurr.matrix()) * T_radar_body_);
+    tf.header.stamp = stamp;
+    tf.header.frame_id = odom_frame_;
+    tf.child_frame_id = tf_body_frame_;
+    tf_broadcaster_->sendTransform(tf);
   }
 
   // input
@@ -498,9 +622,20 @@ private:
   RadarConfig active_config_;
   int max_missing_ = 100;
   int max_range_bins_ = 0;
+  bool reverse_azimuths_ = false;
   bool log_scan_timing_ = false;
   size_t min_filtered_points_ = 20;
   std::string stamp_source_ = "first_azimuth";
+
+  // tf output: odom -> body, composed from the radar pose (see PublishBodyTf).
+  // Only allocated when frames.tf_body_frame is set; otherwise the fuser
+  // broadcasts odom -> radar itself.
+  std::string odom_frame_ = "odom", radar_frame_ = "radar_link", tf_body_frame_;
+  std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+  std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
+  std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+  Eigen::Isometry3d T_radar_body_ = Eigen::Isometry3d::Identity();
+  bool have_radar_from_body_ = false;
 
   // worker thread with a single-slot, drop-oldest queue
   std::thread worker_;

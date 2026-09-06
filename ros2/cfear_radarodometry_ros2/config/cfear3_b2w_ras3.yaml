@@ -27,6 +27,15 @@ cfear_odometry_node:
       range_in_bins: 497                # cropped image width (native 1712 bins = 69 m)
       range_res: 0.040307827            # m/bin (RAS-3 bin size)
       rotation_rate_hz: 4.0
+      # The RAS-3 azimuth index runs CLOCKWISE seen from above, i.e. towards
+      # NEGATIVE bearings in the REP-103 frame this deployment uses (x fwd, y
+      # left, z up). CFEAR's polar->cartesian is hardcoded counter-clockwise, so
+      # without this every scan - and therefore the whole trajectory - is
+      # reflected about x: y -> -y, yaw -> -yaw. Measured on hg_nav_4: net yaw
+      # +50.4 deg against the DLIO reference's -49.30 deg.
+      # Boreas needs it OFF: its radar frame is z-down, where the same physical
+      # rotation is counter-clockwise. See cfear3_boreas.yaml.
+      reverse_azimuths: true
       max_missing_fraction: 0.25        # drop scans missing more azimuths than this
       min_filtered_points: 20
       stamp_source: first_azimuth       # first_azimuth | last_azimuth | now | header
@@ -52,8 +61,13 @@ cfear_odometry_node:
       use_keyframe: true
       use_guess: true
       compensate: true
-      radar_ccw: true                   # Boreas-validated value; flip if the trajectory
-                                        # comes out mirrored on the real RAS-3
+      # Deskew direction, and ONLY that - it cannot mirror anything (both values
+      # give the same rotation sign; that is radar.reverse_azimuths' job). It
+      # must match reverse_azimuths: the row reversal flips how acquisition time
+      # maps to bearing, and Compensate() reads the time back out of the bearing.
+      # Confirmed on hg_nav_4, where the pairing is worth 4.2 m of path length
+      # (26.84 m vs 31.06 m against a 28.04 m reference).
+      radar_ccw: true
       covar_scale: 1.0
       regularization: 0.0
       soft_constraint: false
@@ -75,8 +89,22 @@ cfear_odometry_node:
       # per-scan cost. It cannot affect the estimate: FormatScanMsg works on a
       # copy that never feeds back. Set true to debug in rviz.
       publish_registered_cloud: false
+      # Broadcasts cfear_odom -> base (see frames.tf_body_frame). Safe next to
+      # DLIO, which parents dlio_odom UNDER base rather than the other way
+      # round, so base keeps exactly one parent. Turn this off if some other
+      # source starts publishing a parent for base - two parents make every tf2
+      # lookup depend on arrival order.
       publish_tf: true
 
     frames:
-      odom_frame: odom
+      # Not "odom": bievr-lio already publishes an odom frame, and DLIO names its
+      # own dlio_odom for the same reason. rviz fixed frame for a CFEAR run.
+      odom_frame: cfear_odom
       radar_frame: radar_link
+      # Broadcast cfear_odom -> base rather than cfear_odom -> radar_link. The
+      # navtech_radar container owns radar_link already (static lidar ->
+      # radar_link), and a frame with two parents makes every tf2 lookup - rviz,
+      # "2D Goal Pose", the nav stack - depend on arrival order. The node
+      # composes the estimate with radar_link <- base from tf2; the odometry
+      # topic still carries the radar pose, which is what radarsplat wants.
+      tf_body_frame: base

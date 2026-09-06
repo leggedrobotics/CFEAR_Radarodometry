@@ -66,7 +66,9 @@ ament_target_dependencies(${PROJECT_NAME}_lib
 
 add_executable(cfear_odometry_node src/cfear_odometry_node.cpp)
 target_link_libraries(cfear_odometry_node ${PROJECT_NAME}_lib)
-ament_target_dependencies(cfear_odometry_node rclcpp navtech_msgs cv_bridge)
+ament_target_dependencies(cfear_odometry_node
+  rclcpp navtech_msgs cv_bridge geometry_msgs tf2 tf2_ros tf2_eigen
+)
 
 # Debug/validation: run the pipeline directly on Boreas PNGs (see the file header).
 add_executable(offline_png_test src/offline_png_test.cpp)

@@ -18,6 +18,12 @@ cfear_odometry_node:
       range_in_bins: 3768
       range_res: 0.0596                 # m/bin; CIR204-H (Oxford CTS350-X: 0.0438)
       rotation_rate_hz: 4.0
+      # OFF for Boreas/Oxford: their radar frame is z-down, so the sensor's
+      # physical clockwise rotation is counter-clockwise there and CFEAR's
+      # hardcoded counter-clockwise polar->cartesian is already right. Only a
+      # sensor read in a REP-103 z-UP frame needs the reversal (see
+      # cfear3_b2w_ras3.yaml).
+      reverse_azimuths: false
       max_missing_fraction: 0.25        # drop scans missing more azimuths than this
       min_filtered_points: 20
       stamp_source: first_azimuth       # first_azimuth | last_azimuth | now | header
@@ -43,8 +49,14 @@ cfear_odometry_node:
       use_keyframe: true
       use_guess: true
       compensate: true
-      radar_ccw: true                   # validated on Boreas (matches the ROS1 reference
-                                        # run); flip if the trajectory comes out mirrored
+      # false, matching this preset's stated source of truth: docker/run_boreas.sh
+      # passes --radar_ccw false (its comment above the call says "true" and is
+      # what this file previously copied - the flag, not the comment, is what was
+      # validated), and every upstream oxford_cfear-* preset is false too.
+      # Consistent with the mechanism: bearing grows with acquisition time here,
+      # which is the (d-0.5) branch of GetRelTimeStamp. Deskew only - it cannot
+      # mirror the trajectory; that is radar.reverse_azimuths' job.
+      radar_ccw: false
       covar_scale: 1.0
       regularization: 0.0
       soft_constraint: false
