@@ -22,7 +22,6 @@ find_package(pcl_conversions REQUIRED)
 find_package(cv_bridge REQUIRED)
 find_package(angles REQUIRED)
 find_package(navtech_msgs REQUIRED)
-find_package(messages REQUIRED)
 
 find_package(Eigen3 REQUIRED)
 find_package(Ceres REQUIRED)
@@ -50,7 +49,6 @@ add_library(${PROJECT_NAME}_lib
   src/lib/statistics.cpp
   src/lib/types.cpp
   src/lib/utils.cpp
-  src/fft_assembler.cpp
 )
 target_link_libraries(${PROJECT_NAME}_lib
   Ceres::ceres
@@ -68,7 +66,7 @@ ament_target_dependencies(${PROJECT_NAME}_lib
 
 add_executable(cfear_odometry_node src/cfear_odometry_node.cpp)
 target_link_libraries(cfear_odometry_node ${PROJECT_NAME}_lib)
-ament_target_dependencies(cfear_odometry_node rclcpp navtech_msgs messages cv_bridge)
+ament_target_dependencies(cfear_odometry_node rclcpp navtech_msgs cv_bridge)
 
 # Debug/validation: run the pipeline directly on Boreas PNGs (see the file header).
 add_executable(offline_png_test src/offline_png_test.cpp)

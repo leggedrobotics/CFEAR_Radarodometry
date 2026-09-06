@@ -42,7 +42,12 @@ void radarDriver::Process(){
   else{
     StructuredKStrongest filt(cv_polar_image, par.z_min, par.k_strongest, par.min_distance, par.range_res);
     filt.getPeaksFilteredPointCloud(cloud_filtered_, false);
-    filt.getPeaksFilteredPointCloud(cloud_filtered_peaks_, true);
+    // The peaks cloud costs a second pass plus axial non-max suppression and
+    // feeds nothing but the pose graph - skip it unless asked. cloud_filtered_peaks_
+    // stays the empty cloud allocated above, which every consumer handles
+    // (Compensate iterates it, RadarScan just stores the pointer).
+    if(par.compute_peaks)
+      filt.getPeaksFilteredPointCloud(cloud_filtered_peaks_, true);
   }
   //Fill header
 

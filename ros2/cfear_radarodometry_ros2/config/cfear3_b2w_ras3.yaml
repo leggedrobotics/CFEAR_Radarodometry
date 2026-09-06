@@ -17,8 +17,7 @@
 cfear_odometry_node:
   ros__parameters:
     radar:
-      message_format: polar_image       # navtech_radar_sdk polar_image_publisher / replay frames
-      image_topic: /radar_data/radar_frame
+      image_topic: /radar_data/radar_frame   # navtech_radar_sdk polar_image_publisher / replay frames
       config_topic: /radar_data/configuration_data
       config_durability: transient_local  # driver publishes the config latched
       config_timeout_sec: 5.0
@@ -68,7 +67,14 @@ cfear_odometry_node:
       odom_keyframe_topic: /cfear/odometry_keyframe
       registered_cloud_topic: radar_registered
       registered_keyframe_cloud_topic: radar_registered_keyframe
-      publish_registered_cloud: true
+      # false: the registered cloud is visualization only and nothing in this
+      # deployment subscribes to it (the upstream rviz configs name a topic this
+      # node does not even publish). Measured at 0.35 MB per scan, republished a
+      # second time on every keyframe, and the transform + PCL->ROS serialization
+      # + DDS publish all happen inline in processFrame - i.e. inside the
+      # per-scan cost. It cannot affect the estimate: FormatScanMsg works on a
+      # copy that never feeds back. Set true to debug in rviz.
+      publish_registered_cloud: false
       publish_tf: true
 
     frames:

@@ -49,6 +49,14 @@ public:
     std::string dataset = "oxford";
     filtertype filter_type_ = filtertype::kstrong;
     bool publish_filtered = false; // debug: publish the filtered clouds as PointCloud2
+    // Also run the axial non-maximum suppression pass that produces the "peaks"
+    // cloud. That cloud is NOT used for registration - the only consumer is
+    // RadarScan::cloud_peaks_, i.e. the serialized pose graph - so with
+    // fuser.store_graph off it is pure cost: a second k-strongest extraction
+    // plus, per azimuth, an unordered_map of neighbour scores and a 7-tap sum
+    // per masked bin. Default true keeps the upstream behaviour for the offline
+    // tools; the online node turns it off (see driver.compute_peaks).
+    bool compute_peaks = true;
 
     std::string ToString(){
       std::ostringstream stringStream;
@@ -61,6 +69,7 @@ public:
       stringStream << "radar_frameid, "<<radar_frameid<<endl;
       stringStream << "dataset, "<<dataset<<endl;
       stringStream << "filter type, "<<Filter2str(filter_type_)<<endl;
+      stringStream << "compute peaks, "<<(compute_peaks ? "true" : "false")<<endl;
       stringStream << "nb guard cells, "<<nb_guard_cells<<endl;
       stringStream << "window size, "<<window_size<<endl;
       stringStream << "false alarm rate, "<<false_alarm_rate<<endl;

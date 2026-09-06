@@ -1,15 +1,18 @@
 # CFEAR-3 parameters (best accuracy), tuned for a Boreas-like Navtech CIR204-H:
 # same values as the ROS1 offline pipeline in docker/run_boreas.sh.
+# Input is whole-rotation polar frames on /radar_data/radar_frame; replay a
+# Boreas sequence with radarsplat_replay's "frames" mode (or run the pipeline
+# straight off the PNGs with offline_png_test).
 # radar.* geometry values are only the FALLBACK - the driver's
 # RadarConfigurationMsg overrides them when it arrives.
 cfear_odometry_node:
   ros__parameters:
     radar:
-      fft_topic: /radar_data/fft
+      image_topic: /radar_data/radar_frame
       config_topic: /radar_data/configuration_data
-      fft_reliability: best_effort      # must match the radar driver's publisher QoS
       config_durability: transient_local
       config_timeout_sec: 5.0
+      metadata_columns: 11              # fallback only; announced in the config msg
       azimuth_samples: 400
       encoder_size: 5600
       range_in_bins: 3768
@@ -17,7 +20,7 @@ cfear_odometry_node:
       rotation_rate_hz: 4.0
       max_missing_fraction: 0.25        # drop scans missing more azimuths than this
       min_filtered_points: 20
-      stamp_source: first_azimuth       # first_azimuth | last_azimuth | now
+      stamp_source: first_azimuth       # first_azimuth | last_azimuth | now | header
 
     driver:
       z_min: 60.0

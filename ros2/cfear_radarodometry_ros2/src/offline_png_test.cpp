@@ -1,5 +1,5 @@
 /* Debug/validation tool: run the ported CFEAR pipeline directly on Boreas
- * radar PNGs (bypassing the FFT assembler and DDS entirely) and write a TUM
+ * radar PNGs (bypassing DDS entirely) and write a TUM
  * trajectory. Used to verify the ROS2 port reproduces the ROS1 offline result.
  *
  *   ros2 run cfear_radarodometry_ros2 offline_png_test <radar_dir> <out_tum> [n_scans] [ccw]

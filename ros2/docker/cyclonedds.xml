@@ -2,8 +2,9 @@
 <!--
   CycloneDDS config for the CFEAR online node.
 
-  The per-azimuth FFT stream is ~1600 msgs/s; raise the socket receive buffer so
-  bursts are not dropped. NOTE: with host networking (docker run with net=host)
+  Each radar frame is a whole rotation (hundreds of kB) arriving at the scan
+  rate; raise the socket receive buffer so a frame is not dropped mid-fragment.
+  NOTE: with host networking (docker run with net=host)
   the container uses the HOST kernel, so the host (or Jetson) must allow it:
       sudo sysctl -w net.core.rmem_max=10485760
   Mirror whatever buffer sizes are configured on the robot side.

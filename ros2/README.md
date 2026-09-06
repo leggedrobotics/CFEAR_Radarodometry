@@ -1,40 +1,30 @@
 # CFEAR Radar Odometry — online ROS2 Jazzy port
 
 Online radar odometry from a live Navtech radar: subscribes the driver's
-**per-azimuth FFT messages**, assembles full polar rotations, runs the
-CFEAR-3 pipeline in-process, and publishes `nav_msgs/Odometry` on
-**`/odometry`** (plus an optional `odom -> radar_link` TF).
+**whole-rotation polar frames**, runs the CFEAR-3 pipeline in-process, and
+publishes `nav_msgs/Odometry` on **`/odometry`** (plus an optional
+`odom -> radar_link` TF).
 
-Two wire formats are supported, selected by `radar.message_format`:
-- `navtech_msgs` (default) — `navtech_msgs/RadarFftDataMsg` +
-  `RadarConfigurationMsg`, the official Navtech IA SDK messages (plain-typed
-  fields), default topic `/radar_data/fft`.
-- `legacy_bytes` — `messages/RadarFftDataMessage` + `RadarConfigurationMessage`,
-  the leggedrobotics `navtech_radar_ros` driver fork (every scalar field packed
-  as a network-order `uint8[]` byte array), default topic `/radar_data/fft_data`.
-  See [cfear_radarodometry_ros2/include/cfear_radarodometry/legacy_radar_codec.h](cfear_radarodometry_ros2/include/cfear_radarodometry/legacy_radar_codec.h)
-  for the decode and its caveats (`bin_size` in particular), and
-  [cfear_radarodometry_ros2/config/cfear3_b2w_legacy_spokes.yaml](cfear_radarodometry_ros2/config/cfear3_b2w_legacy_spokes.yaml)
-  for the preset (kept for `radarsplat_replay`'s spokes mode).
-- `polar_image` — `sensor_msgs/Image` whole-rotation polar frames (mono8,
-  rows=azimuths, leading 11 Oxford/Boreas metadata columns per row) from the
-  leggedrobotics `navtech_radar_sdk` `polar_image_publisher` or
-  `radarsplat_replay`'s frames mode, default topic `/radar_data/radar_frame`,
-  with a latched `navtech_msgs/RadarConfigurationMsg` announcing the layout.
-  See [cfear_radarodometry_ros2/config/cfear3_b2w_ras3.yaml](cfear_radarodometry_ros2/config/cfear3_b2w_ras3.yaml)
-  for the b2w_rsl / RAS-3 preset. The formats are NOT wire compatible with
-  each other.
+Input is `sensor_msgs/Image` polar frames (mono8, rows=azimuths, leading 11
+Oxford/Boreas metadata columns per row) from the leggedrobotics
+`navtech_radar_sdk` `polar_image_publisher` or `radarsplat_replay`'s frames
+mode, default topic `/radar_data/radar_frame`, with a latched
+`navtech_msgs/RadarConfigurationMsg` on `/radar_data/configuration_data`
+announcing the layout. See
+[cfear_radarodometry_ros2/config/cfear3_b2w_ras3.yaml](cfear_radarodometry_ros2/config/cfear3_b2w_ras3.yaml)
+for the b2w_rsl / RAS-3 preset.
+
+The node never sees per-azimuth FFT spokes: the publisher hands over rotations
+already assembled, so there is no spoke assembler here.
 
 The ROS1 tree at the repository root is untouched — the offline Boreas
 pipeline in [../docker/](../docker/) keeps working as before.
 
 ```
 ros2/
-├── navtech_msgs/             vendored Navtech IA SDK messages (navtech_msgs format)
-├── messages/                 vendored navtech_radar_ros-fork messages (legacy_bytes format)
-├── cfear_radarodometry_ros2/ the port: assembler + filter + registration + node
-├── docker/                   Dockerfile (Jazzy), CycloneDDS config, run script
-└── tools/boreas_fft_replay.py  hardware-free end-to-end test from Boreas PNGs (navtech_msgs format)
+├── navtech_msgs/             vendored Navtech IA SDK messages (RadarConfigurationMsg)
+├── cfear_radarodometry_ros2/ the port: filter + registration + node
+└── docker/                   Dockerfile (Jazzy), CycloneDDS config, run script
 ```
 
 ## Build & run (Docker)
@@ -47,14 +37,14 @@ docker build -f ros2/docker/Dockerfile -t cfear_ros2 .
 # host kernel serves the sockets under --net=host -> raise the receive buffer once:
 sudo sysctl -w net.core.rmem_max=10485760
 
-./ros2/docker/run_online.sh                       # defaults: /radar_data/fft -> /odometry
-./ros2/docker/run_online.sh fft_topic:=/my/fft odom_topic:=/my/odom
+./ros2/docker/run_online.sh                       # defaults: /radar_data/radar_frame -> /odometry
+./ros2/docker/run_online.sh image_topic:=/my/frames odom_topic:=/my/odom
 ```
 
 The image sets `RMW_IMPLEMENTATION=rmw_cyclonedds_cpp` (the robot runs
 CycloneDDS; mixing DDS vendors is a classic silent-failure source) and loads
 [docker/cyclonedds.xml](docker/cyclonedds.xml) with a 10 MB receive buffer for
-the ~1600 msg/s FFT stream. Make sure `ROS_DOMAIN_ID` matches the driver
+the whole-rotation frames. Make sure `ROS_DOMAIN_ID` matches the driver
 machine; `--net=host` (set by `run_online.sh`) is required for DDS discovery.
 
 **Jetson / arm64:** the same Dockerfile builds natively on a Jetson (or
@@ -80,30 +70,31 @@ Algorithm parameters are the CFEAR-3 set validated offline on Boreas
 Run with `params_file:=$(ros2 pkg prefix --share cfear_radarodometry_ros2)/config/cfear3_b2w_ras3.yaml`
 against the leggedrobotics `navtech_radar_sdk` driver's
 `/radar_data/radar_frame` + `/radar_data/configuration_data` topics. This
-preset sets `radar.message_format: polar_image` and publishes odometry on
-`/cfear/odometry` (not `/odometry` — `fognav_replay` also publishes there from
-dataset ground truth; never run both against the same topic). Against dataset
-replay, prefer `radar.stamp_source: header` (replayed metadata carries
-dataset-era time). The legacy spoke preset lives on as
-`cfear3_b2w_legacy_spokes.yaml`.
+preset publishes odometry on `/cfear/odometry` (not `/odometry` —
+`fognav_replay` also publishes there from dataset ground truth; never run both
+against the same topic). Against dataset replay, prefer
+`radar.stamp_source: header` (replayed metadata carries dataset-era time).
 
 ## Testing without hardware (Boreas replay)
 
-Terminal 1 — odometry node; Terminal 2 — replay a Boreas sequence as FFT
-messages; Terminal 3 — record:
+Terminal 1 — odometry node; Terminal 2 — replay a Boreas sequence as polar
+frames with `radarsplat_replay` (`publish_mode: frames`, in the RadarSplat
+repo's replay container); Terminal 3 — record:
 
 ```bash
 docker run --rm -it --net=host --ipc=host -v /path/to/boreas-seq:/data/seq cfear_ros2
 # T1:
 ros2 launch cfear_radarodometry_ros2 cfear_online.launch.py
-# T2 (same container via `docker exec`, or a second `docker run`):
-python3 /ws/tools/boreas_fft_replay.py --seq /data/seq            # real time, 4 Hz
-python3 /ws/tools/boreas_fft_replay.py --seq /data/seq --drop-prob 0.01  # robustness test
+# T2 (replay container): ros2 launch radarsplat_replay dataset_replay.launch.py \
+#     data_dir:=/path/to/dataset
 # T3:
-ros2 topic hz /radar_data/fft          # ~1600 Hz
+ros2 topic hz /radar_data/radar_frame  # ~4 Hz
 ros2 topic echo /odometry --field pose.pose
 ros2 bag record -o cfear_run /odometry
 ```
+
+No replay container at hand? `offline_png_test` runs the same library straight
+off the sequence PNGs, no DDS involved (see the validation note below).
 
 Evaluate against ground truth / the ROS1 result with evo:
 
@@ -125,25 +116,24 @@ row order, `fuser.radar_ccw`, `radar.range_res`).
   reference trajectory to 7.3 m after 2.3 km (≈0.3%, Ceres-version noise).
   Rerun with `ros2 run cfear_radarodometry_ros2 offline_png_test
   /data/seq/radar out.tum 1500 1`.
-- Full online path (replay → assembler → node): 1.5% final difference vs ROS1
-  with exact encoder ticks, 2.1% with the real (jittery) Boreas encoder
-  metadata, zero registration failures, real-time at 2× speed (8 Hz).
+- Full online path (replay → node): 1.5% final difference vs ROS1 with exact
+  encoder ticks, 2.1% with the real (jittery) Boreas encoder metadata, zero
+  registration failures, real-time at 2× speed (8 Hz). Measured through the
+  since-removed spoke path; the frame path feeds the same assembled scans in.
 - `fuser.radar_ccw: true` is the validated value for Boreas — the ROS1
   reference run (`cfear_output/pars.txt`: "radar reversed, true") used it too.
 
 ## Troubleshooting a silent topic
 
-1. `ros2 topic info /radar_data/fft -v` — the node subscribes BEST_EFFORT by
-   default; a RELIABLE-only publisher still matches, but if the driver
-   publishes with incompatible QoS set `radar.fft_reliability`.
+1. `ros2 topic info /radar_data/radar_frame -v` — the node subscribes RELIABLE,
+   matching the driver and `radarsplat_replay`'s frame publishers; a BEST_EFFORT
+   publisher will not match it.
 2. Config never arrives: some drivers publish it volatile-only — set
    `radar.config_durability: volatile` (you then need the driver started
    *after* this node, or rely on the parameter fallback).
-3. Driver forks publishing `RadarFftDataMessage` with byte-array fields (e.g.
-   leggedrobotics' `navtech_radar_ros`) are **not wire compatible** with the
-   vendored `navtech_msgs` (official SDK, plain-typed fields) — set
-   `radar.message_format: legacy_bytes` (see above) instead of writing a
-   translation node.
+3. Frame width mismatches the announced `[start_bin, end_bin)` — the node warns
+   and uses the frame as published; check the driver's range crop, or cap the
+   consumed bins with `radar.max_range_bins`.
 4. `radar_ccw`: if the live trajectory mirrors reality, flip `fuser.radar_ccw`.
 
 ## Notes vs the ROS1 code

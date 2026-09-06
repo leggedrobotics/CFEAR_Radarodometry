@@ -4,8 +4,8 @@
   <name>cfear_radarodometry_ros2</name>
   <version>1.0.0</version>
   <description>
-    Online ROS2 port of CFEAR Radarodometry: subscribes per-azimuth Navtech FFT
-    messages, assembles polar scans, and publishes nav_msgs/Odometry.
+    Online ROS2 port of CFEAR Radarodometry: subscribes whole-rotation polar
+    radar frames (sensor_msgs/Image) and publishes nav_msgs/Odometry.
   </description>
   <maintainer email="cedric.keller@hispeed.ch">Cedric Keller</maintainer>
   <license>BSD-3-Clause</license>
@@ -23,7 +23,6 @@
   <depend>cv_bridge</depend>
   <depend>angles</depend>
   <depend>navtech_msgs</depend>
-  <depend>messages</depend>
 
   <depend>libpcl-all-dev</depend>
   <depend>libopencv-dev</depend>
