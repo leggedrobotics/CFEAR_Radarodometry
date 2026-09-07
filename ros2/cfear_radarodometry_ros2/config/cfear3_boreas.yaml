@@ -26,7 +26,20 @@ cfear_odometry_node:
       reverse_azimuths: false
       max_missing_fraction: 0.25        # drop scans missing more azimuths than this
       min_filtered_points: 20
-      stamp_source: first_azimuth       # first_azimuth | last_azimuth | now | header
+      # first_row is the new name of what this preset always did (the old
+      # first_azimuth is a deprecated alias for it, and the node now warns on
+      # it) - a pure rename, so the validated Boreas runs still reproduce.
+      #
+      # Kept row-indexed rather than moved to sweep_mid on purpose. Boreas rows
+      # do ascend in time, so row 0 really is the sweep's first spoke and the
+      # old name was at least honest here - unlike on the RAS-3, where row 0
+      # holds the LAST spoke (see cfear3_b2w_ras3.yaml). But it still stamps the
+      # sweep START while the pose refers to mid-sweep, so these stamps are
+      # ~125 ms EARLY. sweep_mid is the correct value here too; switch when
+      # there is an appetite to re-baseline the Boreas numbers.
+      #
+      # sweep_mid | sweep_start | sweep_end | first_row | last_row | now | header
+      stamp_source: first_row
 
     driver:
       z_min: 60.0

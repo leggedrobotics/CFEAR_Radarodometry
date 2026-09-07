@@ -75,6 +75,47 @@ preset publishes odometry on `/cfear/odometry` (not `/odometry` —
 against the same topic). Against dataset replay, prefer
 `radar.stamp_source: header` (replayed metadata carries dataset-era time).
 
+### Which instant the odometry is stamped with (`radar.stamp_source`)
+
+The published pose refers to **mid-sweep** and always has: the fuser deskews
+every scan with `Compensate()`, whose `GetRelTimeStamp()` =
+`±(atan2(y,x)/2π − 0.5)` is zero at half a rotation, so every point is
+transported to the middle of the acquisition interval. Stamp it with anything
+else and the pose is mis-dated by up to a full sweep — 250 ms at 4 Hz.
+
+Two families of values, and the difference between them is not cosmetic:
+
+| family | values | meaning |
+| --- | --- | --- |
+| **time-indexed** | `sweep_mid`, `sweep_start`, `sweep_end` | min / mid / max over the valid rows' embedded times. Independent of the publisher's tick→row mapping, and invariant under `radar.reverse_azimuths`. |
+| **row-indexed** | `first_row`, `last_row` (aliases `first_azimuth`, `last_azimuth`) | the embedded time found at the lowest / highest valid **row index**. Says nothing about acquisition order on its own. |
+| neither | `header`, `now` | publisher's header stamp / wall clock. |
+
+`first_azimuth` and `last_azimuth` are **deprecated** and the node warns when
+they are used. They are honest on Boreas, whose rows ascend in time, and a trap
+on the b2w RAS-3: `polar_image_publisher`'s
+`row = round(tick*400/16000) % 400` wraps tick 16000 onto row 0, so **row 0
+holds the sweep's last spoke**. There `first_azimuth` (row 0) and
+`last_azimuth` (row 399) are the same instant to within 0.6 ms — both at the
+sweep **end**, ~125 ms after the pose they label.
+
+For the same reason, mid-sweep must **not** be derived as
+`(stamp_first_row + stamp_last_row)/2`: on the RAS-3 both operands sit at the
+sweep end, so their midpoint is the sweep end and is wrong by the full 125 ms.
+`stamp_sweep_mid()` uses the min and max of the valid rows' times instead.
+
+Measured on `20260825_231849_hg_nav_1` (`/radar_data/radar_frame`, 400/400 rows
+valid): `header.stamp` matches the earliest spoke (row 1) to within 1 µs, row 0
+carries `header + 249.1 ms`, the sweep spans 249.1 ms, and `sweep_mid` lands at
+`header + 124.6 ms`. Replaying that bag through the node confirms the published
+`/cfear/odometry` stamps match the computed midpoint to 0.2 µs over 154
+messages.
+
+`cfear3_b2w_ras3.yaml` uses `sweep_mid`. `cfear3_boreas.yaml` stays on
+`first_row` so the validated Boreas runs keep reproducing — those stamps are the
+sweep start, i.e. ~125 ms *early*; move it to `sweep_mid` when there is an
+appetite to re-baseline.
+
 ## Testing without hardware (Boreas replay)
 
 Terminal 1 — odometry node; Terminal 2 — replay a Boreas sequence as polar

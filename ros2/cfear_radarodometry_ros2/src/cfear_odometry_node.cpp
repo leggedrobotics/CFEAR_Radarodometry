@@ -17,12 +17,14 @@
  * when available; after radar.config_timeout_sec it falls back to the radar.*
  * parameters.
  */
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <thread>
 
 #include <cv_bridge/cv_bridge.hpp>
@@ -43,6 +45,36 @@ using CFEAR_Radarodometry::CompletedScan;
 using CFEAR_Radarodometry::OdometryKeyframeFuser;
 using CFEAR_Radarodometry::RadarConfig;
 using CFEAR_Radarodometry::radarDriver;
+
+// Which instant a scan's odometry is stamped with. See radar.stamp_source.
+enum class StampSource {
+  kSweepMid,    // midpoint of the acquisition interval - what the pose refers to
+  kSweepStart,  // earliest embedded row time
+  kSweepEnd,    // latest embedded row time
+  kFirstRow,    // embedded time of the lowest valid row index
+  kLastRow,     // embedded time of the highest valid row index
+  kNow,         // wall clock when registration finished
+  kHeader,      // the frame publisher's header stamp
+};
+
+// Returns false (leaving `out` untouched) if the name is not recognised, so the
+// caller can complain instead of silently falling back.
+inline bool ParseStampSource(const std::string& name, StampSource& out, bool& deprecated) {
+  deprecated = false;
+  if (name == "sweep_mid")         out = StampSource::kSweepMid;
+  else if (name == "sweep_start")  out = StampSource::kSweepStart;
+  else if (name == "sweep_end")    out = StampSource::kSweepEnd;
+  else if (name == "first_row")    out = StampSource::kFirstRow;
+  else if (name == "last_row")     out = StampSource::kLastRow;
+  else if (name == "now")          out = StampSource::kNow;
+  else if (name == "header")       out = StampSource::kHeader;
+  // Deprecated row-indexed aliases: the names promise acquisition order they do
+  // not deliver (on the RAS-3 both land at the sweep END). Kept for old configs.
+  else if (name == "first_azimuth") { out = StampSource::kFirstRow; deprecated = true; }
+  else if (name == "last_azimuth")  { out = StampSource::kLastRow;  deprecated = true; }
+  else return false;
+  return true;
+}
 
 class CfearOdometryNode : public rclcpp::Node {
 public:
@@ -139,9 +171,38 @@ private:
     declare_parameter<double>("radar.rotation_rate_hz", 4.0);
     declare_parameter<double>("radar.max_missing_fraction", 0.25);
     declare_parameter<int>("radar.min_filtered_points", 20);
-    // first_azimuth|last_azimuth|now|header ("header" uses the frame publisher's
-    // header stamp instead of the embedded per-row metadata times -- needed when
-    // replaying datasets whose metadata carries dataset-era time).
+    // Which instant the published odometry (and the TF, and the debug scan
+    // topic) is stamped with. Two families - see CompletedScan in radar_scan.h.
+    //
+    // TIME-indexed, derived from the min/max of the valid rows' embedded times.
+    // Independent of the publisher's tick -> row mapping, and unaffected by
+    // radar.reverse_azimuths:
+    //   sweep_mid    midpoint of the rotation. THE CORRECT ONE for almost every
+    //                consumer: the fuser deskews every scan to mid-sweep via
+    //                Compensate() (GetRelTimeStamp is zero at half a rotation),
+    //                so mid-sweep is the instant the pose actually refers to.
+    //   sweep_start  first spoke of the rotation (pose is then ~125 ms late).
+    //   sweep_end    last spoke of the rotation  (pose is then ~125 ms early).
+    //
+    // ROW-indexed, i.e. "the metadata time found at the lowest / highest valid
+    // ROW INDEX". These say nothing about acquisition order on their own:
+    //   first_row / last_row
+    //   first_azimuth / last_azimuth   deprecated aliases of the above. The
+    //                names are a trap and are kept only so existing configs and
+    //                recordings stay reproducible: on the b2w RAS-3, row 0 holds
+    //                the LAST spoke of the sweep, so "first_azimuth" stamps at
+    //                the sweep END and is ~125 ms late. Do not use for new work;
+    //                say sweep_start or sweep_mid and mean it.
+    //
+    // Not derived from the scan at all:
+    //   header       the frame publisher's header stamp, ignoring the embedded
+    //                per-row times -- needed when replaying datasets whose
+    //                metadata carries dataset-era time.
+    //   now          wall clock at the time registration finished.
+    //
+    // Default is the deprecated first_azimuth purely to preserve the historical
+    // behaviour of configs that predate the time-indexed family; both shipped
+    // presets set this explicitly.
     declare_parameter<std::string>("radar.stamp_source", "first_azimuth");
 
     // filtering (radarDriver)
@@ -366,7 +427,24 @@ private:
                   "radar.reverse_azimuths=%s with fuser.radar_ccw=%s deskews scans BACKWARDS "
                   "(it adds the motion smear instead of removing it). The two must match.",
                   reverse_azimuths_ ? "true" : "false", fuser_par.radar_ccw ? "true" : "false");
-    stamp_source_ = get_parameter("radar.stamp_source").as_string();
+    const std::string stamp_source_name = get_parameter("radar.stamp_source").as_string();
+    bool stamp_source_deprecated = false;
+    if (!ParseStampSource(stamp_source_name, stamp_source_, stamp_source_deprecated)) {
+      // Previously an unknown value silently behaved as first_azimuth. Say so.
+      RCLCPP_ERROR(get_logger(),
+                   "radar.stamp_source='%s' is not a known value - falling back to sweep_mid. "
+                   "Valid: sweep_mid|sweep_start|sweep_end|first_row|last_row|now|header.",
+                   stamp_source_name.c_str());
+      stamp_source_ = StampSource::kSweepMid;
+    } else if (stamp_source_deprecated) {
+      RCLCPP_WARN(get_logger(),
+                  "radar.stamp_source='%s' is a deprecated ROW-indexed alias and does not mean "
+                  "what it says: it takes the metadata time of the %s valid ROW, which on the "
+                  "b2w RAS-3 sits at the sweep END (row 0 holds the last spoke). The pose refers "
+                  "to MID-sweep, so this stamps it ~125 ms late. Use sweep_mid.",
+                  stamp_source_name.c_str(),
+                  stamp_source_ == StampSource::kFirstRow ? "lowest" : "highest");
+    }
 
     active_config_ = cfg;
     pipeline_ready_ = true;
@@ -427,35 +505,58 @@ private:
       header_stamp = now();
 
     if (meta >= 11) {
+      // Track the row-indexed ends (lowest / highest valid ROW) and the
+      // time-indexed ends (earliest / latest embedded TIME) separately. They
+      // coincide on Boreas and they do not on the b2w RAS-3, where
+      // polar_image_publisher wraps the sweep's last spoke onto row 0: there
+      // first_valid and last_valid are rows 0 and 399 and BOTH carry a sweep-end
+      // time, while the earliest spoke sits at row 1. Deriving mid-sweep from
+      // the row-indexed pair would therefore land on the sweep end - a quarter
+      // second wrong - which is why the scan carries both.
       int first_valid = -1, last_valid = -1, missing = 0;
+      uint64_t earliest_us = 0, latest_us = 0;
       for (int r = 0; r < h; r++) {
         if (full.ptr<uint8_t>(r)[10] == 255) {
-          if (first_valid < 0)
+          const uint64_t us = RowTimestampUs(full, r);
+          if (first_valid < 0) {
             first_valid = r;
+            earliest_us = latest_us = us;
+          }
           last_valid = r;
+          earliest_us = std::min(earliest_us, us);
+          latest_us = std::max(latest_us, us);
         } else {
           missing++;
         }
       }
       scan.missing_azimuths = missing;
-      if (first_valid >= 0 && stamp_source_ != "header") {
-        scan.stamp_first = rclcpp::Time(
-            static_cast<int64_t>(RowTimestampUs(full, first_valid)) * 1000, RCL_ROS_TIME);
-        scan.stamp_last = rclcpp::Time(
-            static_cast<int64_t>(RowTimestampUs(full, last_valid)) * 1000, RCL_ROS_TIME);
+      if (first_valid >= 0 && stamp_source_ != StampSource::kHeader) {
+        const auto to_time = [](uint64_t us) {
+          return rclcpp::Time(static_cast<int64_t>(us) * 1000, RCL_ROS_TIME);
+        };
+        scan.stamp_first_row = to_time(RowTimestampUs(full, first_valid));
+        scan.stamp_last_row = to_time(RowTimestampUs(full, last_valid));
+        scan.stamp_sweep_start = to_time(earliest_us);
+        scan.stamp_sweep_end = to_time(latest_us);
       } else {
-        scan.stamp_first = header_stamp;
-        scan.stamp_last = header_stamp;
+        scan.stamp_first_row = header_stamp;
+        scan.stamp_last_row = header_stamp;
+        scan.stamp_sweep_start = header_stamp;
+        scan.stamp_sweep_end = header_stamp;
       }
     } else {
       // No embedded metadata: synthesize the rotation span from the header
-      // stamp and the configured rotation rate.
+      // stamp and the configured rotation rate. Rows are assumed to ascend in
+      // time here, so the two families coincide by construction.
       scan.missing_azimuths = 0;
-      scan.stamp_first = header_stamp;
       const double rate =
           active_config_.rotation_rate_hz > 0 ? active_config_.rotation_rate_hz : 4.0;
-      scan.stamp_last =
+      const rclcpp::Time span_end =
           header_stamp + rclcpp::Duration::from_seconds((h - 1.0) / (h * rate));
+      scan.stamp_first_row = header_stamp;
+      scan.stamp_last_row = span_end;
+      scan.stamp_sweep_start = header_stamp;
+      scan.stamp_sweep_end = span_end;
     }
 
     EnqueueScan(std::move(scan));
@@ -506,11 +607,20 @@ private:
   }
 
   void ProcessScan(CompletedScan& scan) {
-    rclcpp::Time stamp = scan.stamp_first;
-    if (stamp_source_ == "last_azimuth")
-      stamp = scan.stamp_last;
-    else if (stamp_source_ == "now")
-      stamp = now();
+    // The one place the output stamp is chosen. sweep_mid is the physically
+    // right answer: the cloud below has been deskewed to mid-sweep, so that is
+    // the instant the pose refers to. Everything else is offered for
+    // reproducing older runs or for datasets without usable embedded times.
+    rclcpp::Time stamp;
+    switch (stamp_source_) {
+      case StampSource::kSweepMid:   stamp = scan.stamp_sweep_mid();  break;
+      case StampSource::kSweepStart: stamp = scan.stamp_sweep_start;  break;
+      case StampSource::kSweepEnd:   stamp = scan.stamp_sweep_end;    break;
+      case StampSource::kFirstRow:   stamp = scan.stamp_first_row;    break;
+      case StampSource::kLastRow:    stamp = scan.stamp_last_row;     break;
+      case StampSource::kNow:        stamp = now();                   break;
+      case StampSource::kHeader:     stamp = scan.stamp_sweep_start;  break;  // all four hold the header stamp
+    }
 
     // Clockwise sensor -> REP-103 bearings. The single seam where every scan
     // passes, and it must happen before ProcessPolarImage: radar_filters.cpp is
@@ -529,7 +639,7 @@ private:
     // Debug: dump assembled scans for bytewise comparison against source PNGs.
     if (const char* dump_dir = std::getenv("CFEAR_DUMP_DIR"))
       cv::imwrite(std::string(dump_dir) + "/" +
-                  std::to_string(rclcpp::Time(scan.stamp_first).nanoseconds() / 1000) + ".png",
+                  std::to_string(rclcpp::Time(scan.stamp_sweep_start).nanoseconds() / 1000) + ".png",
                   scan.polar);
 
     const auto t_start = std::chrono::steady_clock::now();
@@ -625,7 +735,7 @@ private:
   bool reverse_azimuths_ = false;
   bool log_scan_timing_ = false;
   size_t min_filtered_points_ = 20;
-  std::string stamp_source_ = "first_azimuth";
+  StampSource stamp_source_ = StampSource::kSweepMid;
 
   // tf output: odom -> body, composed from the radar pose (see PublishBodyTf).
   // Only allocated when frames.tf_body_frame is set; otherwise the fuser

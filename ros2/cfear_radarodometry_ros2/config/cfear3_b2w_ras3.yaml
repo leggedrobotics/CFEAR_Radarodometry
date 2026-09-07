@@ -38,7 +38,26 @@ cfear_odometry_node:
       reverse_azimuths: true
       max_missing_fraction: 0.25        # drop scans missing more azimuths than this
       min_filtered_points: 20
-      stamp_source: first_azimuth       # first_azimuth | last_azimuth | now | header
+      # MID-sweep, and not negotiable on this sensor. The pose is a mid-sweep
+      # quantity - the fuser deskews every scan to half a rotation via
+      # Compensate() - so any other choice mis-stamps it by up to a full sweep.
+      #
+      # The previous value, first_azimuth, was ~125 ms LATE: it is ROW-indexed
+      # (the metadata time of the lowest valid row), and polar_image_publisher's
+      # row = round(tick*400/16000) % 400 wraps the RAS-3's tick 16000 onto row
+      # 0, so row 0 carries the sweep's LAST spoke. last_azimuth (row 399) is
+      # the same instant minus 0.6 ms, so it was no better. Measured on
+      # 20260825_231849_hg_nav_1: header.stamp = the first spoke to within 1 us,
+      # row 0 = header + 249.1 ms, sweep span 249.1 ms, sweep_mid = header +
+      # 124.6 ms.
+      #
+      # NOTE this shifts /cfear/odometry 125 ms earlier against every other
+      # sensor. Bags of /cfear/odometry recorded before this change carry the
+      # old convention and must not be compared against new ones without
+      # accounting for it.
+      #
+      # sweep_mid | sweep_start | sweep_end | first_row | last_row | now | header
+      stamp_source: sweep_mid
 
     driver:
       z_min: 60.0
