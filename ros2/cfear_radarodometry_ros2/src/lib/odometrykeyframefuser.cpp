@@ -93,7 +93,7 @@ pcl::PointXYZI OdometryKeyframeFuser::Transform(const Eigen::Affine3d& T, pcl::P
   p2.intensity = p.intensity;
   return p2;
 }
-nav_msgs::msg::Odometry OdometryKeyframeFuser::FormatOdomMsg(const Eigen::Affine3d& T, const Eigen::Affine3d& Tmot, const rclcpp::Time& t, Matrix6d& Cov){
+nav_msgs::msg::Odometry OdometryKeyframeFuser::FormatOdomMsg(const Eigen::Affine3d& T, const Eigen::Affine3d& Tmot, const rclcpp::Time& t, Matrix6d& Cov, double dt){
   nav_msgs::msg::Odometry odom_msg;
 
   //double d = Tmot.translation().norm();
@@ -109,7 +109,26 @@ nav_msgs::msg::Odometry OdometryKeyframeFuser::FormatOdomMsg(const Eigen::Affine
   odom_msg.header.frame_id = par.odometry_link_id;
   odom_msg.child_frame_id = par.child_frame_id;
   odom_msg.pose.pose = tf2::toMsg(Eigen::Isometry3d(T.matrix()));
+  odom_msg.twist.twist = FormatTwist(Tmot, dt);
   return odom_msg;
+}
+
+geometry_msgs::msg::Twist OdometryKeyframeFuser::FormatTwist(const Eigen::Affine3d& Tmot, double dt){
+  // Tmot = T_prev^-1 * T_current is the frame-to-frame motion expressed in the
+  // previous sensor frame, i.e. a body-frame displacement; divided by the elapsed
+  // time it is the body-frame twist nav_msgs/Odometry expects in child_frame_id.
+  // CFEAR registers x, y and yaw only, so the twist is planar (vz, wx, wy = 0 by
+  // construction) and lives at the radar, not at base_link: consumers that need the
+  // base velocity must add the omega x r lever-arm term themselves.
+  geometry_msgs::msg::Twist tw;  // zero-initialised: no twist when dt is unusable
+  if(!(dt > 0.0))
+    return tw;
+  const Eigen::Vector3d v = Tmot.translation()/dt;
+  const Eigen::AngleAxisd aa(Tmot.rotation());
+  const Eigen::Vector3d w = aa.axis()*aa.angle()/dt;
+  tw.linear.x = v(0); tw.linear.y = v(1); tw.linear.z = v(2);
+  tw.angular.x = w(0); tw.angular.y = w(1); tw.angular.z = w(2);
+  return tw;
 }
 pcl::PointCloud<pcl::PointXYZI> OdometryKeyframeFuser::FormatScanMsg(pcl::PointCloud<pcl::PointXYZI>& cloud_in, Eigen::Affine3d& T){
   pcl::PointCloud<pcl::PointXYZI> cloud_out;
@@ -190,7 +209,14 @@ void OdometryKeyframeFuser::processFrame(pcl::PointCloud<pcl::PointXYZI>::Ptr& c
       }
   }
 
-  nav_msgs::msg::Odometry msg_current = FormatOdomMsg(Tcurrent, Tmot, t, cov_current);
+  // Elapsed time behind Tmot: the stamp gap to the previous processed frame when
+  // one exists (robust to dropped frames), else the nominal sweep period.
+  double dt_mot = Tsensor;
+  if(have_t_prev_){
+    const double gap = (t - t_prev_).seconds();
+    if(gap > 0.0) dt_mot = gap;
+  }
+  nav_msgs::msg::Odometry msg_current = FormatOdomMsg(Tcurrent, Tmot, t, cov_current, dt_mot);
   if(node_ != nullptr){
     if(par.visualize){
       pcl::PointCloud<pcl::PointXYZI> cld_latest = FormatScanMsg(*cloud, Tcurrent);
@@ -220,7 +246,10 @@ void OdometryKeyframeFuser::processFrame(pcl::PointCloud<pcl::PointXYZI>::Ptr& c
     distance_traveled += Tkeydiff.translation().norm();
     Tprev_fused = Tcurrent;
     if(node_ != nullptr){
-      nav_msgs::msg::Odometry msg_keyframe = FormatOdomMsg(Tcurrent, Tkeydiff, t, cov_vek.back());
+      // Tkeydiff spans several frames; the keyframe message carries the same
+      // instantaneous twist as the latest-pose message, not Tkeydiff/dt.
+      nav_msgs::msg::Odometry msg_keyframe = FormatOdomMsg(Tcurrent, Tkeydiff, t, cov_vek.back(), 0.0);
+      msg_keyframe.twist = msg_current.twist;
       pose_keyframe_publisher->publish(msg_keyframe);
       if(par.visualize){
         pcl::PointCloud<pcl::PointXYZI> cld_keyframe = FormatScanMsg(*cloud, Tcurrent);
@@ -245,6 +274,8 @@ void OdometryKeyframeFuser::processFrame(pcl::PointCloud<pcl::PointXYZI>::Ptr& c
   CFEAR_Radarodometry::timing.Document("register", ToMs(t3-t2));
   CFEAR_Radarodometry::timing.Document("publish_etc", ToMs(t4-t3));
   T_prev = Tcurrent;
+  t_prev_ = t;
+  have_t_prev_ = true;
 
 }
 

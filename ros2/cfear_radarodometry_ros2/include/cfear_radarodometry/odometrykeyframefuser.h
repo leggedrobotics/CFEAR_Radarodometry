@@ -4,6 +4,7 @@
 
 #include <rclcpp/rclcpp.hpp>
 #include <nav_msgs/msg/odometry.hpp>
+#include <geometry_msgs/msg/twist.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <tf2_ros/transform_broadcaster.h>
@@ -150,6 +151,8 @@ protected:
   unsigned int nr_reg_failures_ = 0;
   double distance_traveled = 0.0;
   double Tsensor = 1.0/4.0; // set from par.rotation_rate_hz in the constructor
+  rclcpp::Time t_prev_;      // stamp of the previous processed frame, for the twist
+  bool have_t_prev_ = false;
 
 
   Parameters par;
@@ -196,7 +199,10 @@ private:
 
   pcl::PointXYZI Transform(const Eigen::Affine3d& T, pcl::PointXYZI& p);
 
-  nav_msgs::msg::Odometry FormatOdomMsg(const Eigen::Affine3d& T, const Eigen::Affine3d& Tmot, const rclcpp::Time& t, Matrix6d &Cov);
+  // dt: elapsed time behind Tmot; the twist is Tmot/dt in the child (sensor) frame, zero when dt <= 0.
+  nav_msgs::msg::Odometry FormatOdomMsg(const Eigen::Affine3d& T, const Eigen::Affine3d& Tmot, const rclcpp::Time& t, Matrix6d &Cov, double dt);
+
+  static geometry_msgs::msg::Twist FormatTwist(const Eigen::Affine3d& Tmot, double dt);
 
   pcl::PointCloud<pcl::PointXYZI> FormatScanMsg(pcl::PointCloud<pcl::PointXYZI>& cloud_in, Eigen::Affine3d& T);
 
